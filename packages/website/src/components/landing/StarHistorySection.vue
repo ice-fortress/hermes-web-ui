@@ -1,13 +1,19 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useScrollReveal } from '@/composables/useScrollReveal'
+import { useTheme } from '@/composables/useTheme'
 
 const { t } = useI18n()
+const { isDark } = useTheme()
 useScrollReveal()
 
 const stars = ref<number | null>(null)
-const chartLoaded = ref(false)
+
+const chartSrc = computed(() => {
+  const base = 'https://api.star-history.com/svg?repos=EKKOLearnAI%2Fhermes-web-ui&type=Date'
+  return isDark.value ? `${base}&theme=dark` : base
+})
 
 onMounted(async () => {
   try {
@@ -56,18 +62,11 @@ onMounted(async () => {
         rel="noopener noreferrer"
         class="chart-link"
       >
-        <picture>
-          <source
-            media="(prefers-color-scheme: dark)"
-            srcset="https://api.star-history.com/svg?repos=EKKOLearnAI%2Fhermes-web-ui&type=Date&theme=dark"
-          />
-          <img
-            src="https://api.star-history.com/svg?repos=EKKOLearnAI%2Fhermes-web-ui&type=Date"
-            alt="Star History"
-            class="chart-img"
-            @load="chartLoaded = true"
-          />
-        </picture>
+        <img
+          :src="chartSrc"
+          alt="Star History"
+          class="chart-img"
+        />
       </a>
     </div>
   </div>
