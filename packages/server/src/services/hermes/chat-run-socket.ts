@@ -24,6 +24,7 @@ import { getModelContextLength } from './model-context'
 import { ChatContextCompressor, countTokens, SUMMARY_PREFIX } from '../../lib/context-compressor'
 import { getCompressionSnapshot } from '../../db/hermes/compression-snapshot'
 import { parseLLMJSON, parseToolArguments, parseAnthropicContentArray } from '../../lib/llm-json'
+import { updateUsage } from '../../db/hermes/usage-store'
 import { logger } from '../logger'
 
 /**
@@ -141,7 +142,6 @@ interface SessionMessage {
   reasoning?: string | null
   reasoning_details?: string | null
   reasoning_content?: string | null
-  codex_reasoning_items?: string | null
 }
 
 interface QueuedRun {
@@ -967,6 +967,18 @@ export class ChatRunSocket {
           })
           const finalOutput = parsed.response || parsed
           const finalText = extractResponseText(finalOutput)
+          if (upstreamEvent === 'response.completed' && session_id) {
+            const usage = finalOutput.usage || {}
+            updateUsage(session_id, {
+              inputTokens: usage.input_tokens ?? usage.inputTokens ?? 0,
+              outputTokens: usage.output_tokens ?? usage.outputTokens ?? 0,
+              cacheReadTokens: usage.cache_read_tokens ?? usage.cacheReadTokens ?? 0,
+              cacheWriteTokens: usage.cache_write_tokens ?? usage.cacheWriteTokens ?? 0,
+              reasoningTokens: usage.reasoning_tokens ?? usage.reasoningTokens ?? 0,
+              model: finalOutput.model || '',
+              profile: this.sessionMap.get(session_id)?.profile,
+            })
+          }
           const eventName = upstreamEvent === 'response.completed' ? 'run.completed' : 'run.failed'
           emit(eventName, {
             event: eventName,
@@ -1071,7 +1083,6 @@ export class ChatRunSocket {
       const item = parsed.item || parsed.output_item || parsed
       if (item.type !== 'function_call') return null
       const callId = item.call_id || item.id
-      const name = item.name || item.function?.name || ''
       if (!callId) return null
       run.toolCalls.set(callId, responseFunctionCallToToolCall(item))
       return null
@@ -1271,7 +1282,7 @@ export class ChatRunSocket {
   }
 
   /** Mark a session run as completed/failed so reconnecting clients get notified */
-  private async markCompleted(socket: Socket, sessionId: string, _info: { event: string; run_id?: string }) {
+  private async markCompleted(_socket: Socket, sessionId: string, _info: { event: string; run_id?: string }) {
     const state = this.sessionMap.get(sessionId)
     if (state) {
       if (state.isAborting) {
