@@ -918,13 +918,6 @@ export class ChatRunSocket {
         state.abortController = abortController
       }
 
-      try {
-        const inputPreview = typeof body.input === 'string'
-          ? body.input.slice(0, 100)
-          : JSON.stringify(body.input, null, 2).slice(0, 500)
-        console.log('[chat-run-socket] sending request to upstream, input:', inputPreview)
-      } catch {}
-
       const res = await fetch(`${upstream}/v1/responses`, {
         method: 'POST',
         headers,
@@ -1027,7 +1020,6 @@ export class ChatRunSocket {
       })
       if (session_id && queueLen > 0) this.dequeueNextQueuedRun(socket, session_id)
     } catch (err: any) {
-      console.error('[chat-run-socket] handleRun error:', err)
       const queueLen = session_id ? this.sessionMap.get(session_id)?.queue?.length ?? 0 : 0
       if (session_id) {
         void this.markCompleted(socket, session_id, { event: 'run.failed' }).then(() => {
