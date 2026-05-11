@@ -125,6 +125,7 @@ interface ManagedGateway {
   port: number
   host: string
   url: string
+  owned: boolean
   process?: ChildProcess
 }
 
@@ -359,7 +360,7 @@ export class GatewayManager {
     const configuredUrl = buildHttpUrl(host, configuredPort)
     if (pid && this.isProcessAlive(pid) && await this.checkHealth(configuredUrl, 1000)) {
       logger.info('Profile "%s" already running on configured port %d (PID: %d)', name, configuredPort, pid)
-      this.gateways.set(name, { pid, port: configuredPort, host, url: configuredUrl })
+      this.gateways.set(name, { pid, port: configuredPort, host, url: configuredUrl, owned: false })
       this.allocatedPorts.add(configuredPort)
       return { port: configuredPort, host }
     }
@@ -465,7 +466,7 @@ export class GatewayManager {
     const url = buildHttpUrl(host, port)
 
     if (pid && this.isProcessAlive(pid) && await this.checkHealth(url)) {
-      this.gateways.set(name, { pid, port, host, url })
+      this.gateways.set(name, { pid, port, host, url, owned: false })
       return { profile: name, port, host, url, running: true, pid }
     }
 
@@ -493,8 +494,18 @@ export class GatewayManager {
     // 检查是否已在运行
     const existing = this.gateways.get(name)
     if (existing && this.isProcessAlive(existing.pid)) {
-      logger.info('Gateway for profile "%s" already running (PID: %d, port: %d)', name, existing.pid, existing.port)
-      return { profile: name, port: existing.port, host: existing.host, url: existing.url, running: true, pid: existing.pid }
+      if (await this.checkHealth(existing.url, 1000)) {
+        logger.info('Gateway for profile "%s" already running (PID: %d, port: %d)', name, existing.pid, existing.port)
+        return { profile: name, port: existing.port, host: existing.host, url: existing.url, running: true, pid: existing.pid }
+      }
+
+      logger.info('Gateway for profile "%s" is alive but unhealthy (PID: %d, port: %d), restarting',
+        name, existing.pid, existing.port)
+      try {
+        await this.stop(name)
+      } catch (err) {
+        logger.debug('Failed to stop unhealthy gateway before restart: %s', err)
+      }
     }
 
     const endpoint = await this.resolvePort(name)
@@ -546,7 +557,7 @@ export class GatewayManager {
       logger.info('Starting gateway for profile "%s" (run mode, PID: %d, port: %d)', name, pid, port)
 
       // 保存子进程引用，用于后续管理
-      this.gateways.set(name, { pid, port, host, url, process: child })
+      this.gateways.set(name, { pid, port, host, url, owned: true, process: child })
 
       this.waitForReady(name, pid, port, host, url)
         .then(resolve)
@@ -564,8 +575,15 @@ export class GatewayManager {
       if (await this.checkHealth(url, 2000)) {
         // "gateway start" 自行管理进程，重新从 pid 文件读取实际 PID
         const actualPid = this.readPidFile(name) ?? pid
-        const processRef = this.gateways.get(name)?.process
-        this.gateways.set(name, { pid: actualPid, port, host, url, process: processRef })
+        const previous = this.gateways.get(name)
+        this.gateways.set(name, {
+          pid: actualPid,
+          port,
+          host,
+          url,
+          owned: previous?.owned ?? true,
+          process: previous?.process,
+        })
         return { profile: name, port, host, url, running: true, pid: actualPid || undefined }
       }
       await new Promise(r => setTimeout(r, 500))
@@ -752,7 +770,9 @@ export class GatewayManager {
 
   /** 停止所有已管理的网关（并行执行） */
   async stopAll(): Promise<void> {
-    const entries = Array.from(this.gateways.keys())
+    const entries = Array.from(this.gateways.entries())
+      .filter(([, gw]) => gw.owned)
+      .map(([name]) => name)
     await Promise.allSettled(entries.map(name => this.stop(name)))
   }
 
@@ -792,8 +812,18 @@ export class GatewayManager {
     for (const name of profiles) {
       const existing = this.gateways.get(name)
       if (existing && this.isProcessAlive(existing.pid)) {
-        logger.info('%s: already running (PID: %d, port: %d)', name, existing.pid, existing.port)
-        continue
+        if (await this.checkHealth(existing.url, 1000)) {
+          logger.info('%s: already running (PID: %d, port: %d)', name, existing.pid, existing.port)
+          continue
+        }
+
+        logger.info('%s: process alive but unhealthy (PID: %d, port: %d), restarting',
+          name, existing.pid, existing.port)
+        try {
+          await this.stop(name)
+        } catch (err) {
+          logger.debug('Failed to stop unhealthy gateway: %s', err)
+        }
       }
 
       // Skip remote profiles — local hermes command cannot start remote gateways
@@ -813,14 +843,14 @@ export class GatewayManager {
         if (await this.checkHealth(configuredUrl, 2000)) {
           // Health check 通过，说明网关正常工作
           logger.info('%s: gateway already running on configured port %d (PID: %d, health check passed)',
-                     name, configuredPort, pid)
+            name, configuredPort, pid)
           // 注册到内存中
-          this.gateways.set(name, { pid, port: configuredPort, host, url: configuredUrl })
+          this.gateways.set(name, { pid, port: configuredPort, host, url: configuredUrl, owned: false })
           continue
         } else {
           // Health check 失败，说明网关有问题（僵尸进程或端口冲突）
           logger.info('%s: stale process (PID: %d) health check failed on port %d, stopping and restarting',
-                     name, pid, configuredPort)
+            name, pid, configuredPort)
           try {
             await this.stop(name)
           } catch (err) {

@@ -21,17 +21,6 @@ import { GroupChatServer } from './services/hermes/group-chat'
 import { ChatRunSocket } from './services/hermes/chat-run-socket'
 import { logger } from './services/logger'
 
-// 添加全局错误处理器
-process.on('uncaughtException', (error) => {
-  console.error('❌ UNCAUGHT EXCEPTION:', error)
-  console.error('Error stack:', error?.stack)
-})
-
-process.on('unhandledRejection', (reason, promise) => {
-  console.error('❌ UNHANDLED REJECTION:', reason)
-  console.error('Promise:', promise)
-})
-
 // Injected by esbuild at build time; fallback to reading package.json in dev mode
 declare const __APP_VERSION__: string
 const APP_VERSION = typeof __APP_VERSION__ !== 'undefined'
@@ -40,12 +29,17 @@ const APP_VERSION = typeof __APP_VERSION__ !== 'undefined'
 
 // Global error handlers
 process.on('uncaughtException', (err) => {
+  console.error('FATAL: Uncaught exception')
+  console.error(err)
   logger.fatal(err, 'Uncaught exception')
   process.exit(1)
 })
 
 process.on('unhandledRejection', (reason) => {
+  console.error('FATAL: Unhandled rejection')
+  console.error(reason)
   logger.error(reason, 'Unhandled rejection')
+  process.exit(1)
 })
 
 let server: any = null
@@ -191,12 +185,9 @@ export async function bootstrap() {
   startVersionCheck()
 }
 
-// 添加 try-catch 来捕获启动错误
-try {
-  bootstrap()
-} catch (error) {
-  console.error('❌ FATAL ERROR during bootstrap:', error)
-  console.error('Error type:', (error as any)?.constructor?.name)
-  console.error('Error message:', (error as any)?.message)
+bootstrap().catch((error) => {
+  console.error('FATAL: Failed to start Hermes Web UI')
+  console.error(error)
+  logger.fatal(error, 'Fatal error during bootstrap')
   process.exit(1)
-}
+})
