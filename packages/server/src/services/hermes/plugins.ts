@@ -1,6 +1,7 @@
 import { execFile } from 'child_process'
 import { existsSync } from 'fs'
 import { dirname, join, resolve } from 'path'
+import { homedir } from 'os'
 import { promisify } from 'util'
 
 const execFileAsync = promisify(execFile)
@@ -235,7 +236,7 @@ function resolveHermesAgentRoot(): string {
     process.env.HERMES_AGENT_ROOT?.trim(),
     ...maybeRootFromHermesBin(),
     '/opt/hermes',
-    join(process.env.HOME || '', '.hermes', 'hermes-agent'),
+    join(homedir(), '.hermes', 'hermes-agent'),
   ].filter(Boolean) as string[]
 
   return candidates.find(hasHermesPluginModule) || ''

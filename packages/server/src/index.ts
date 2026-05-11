@@ -21,6 +21,17 @@ import { GroupChatServer } from './services/hermes/group-chat'
 import { ChatRunSocket } from './services/hermes/chat-run-socket'
 import { logger } from './services/logger'
 
+// 添加全局错误处理器
+process.on('uncaughtException', (error) => {
+  console.error('❌ UNCAUGHT EXCEPTION:', error)
+  console.error('Error stack:', error?.stack)
+})
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('❌ UNHANDLED REJECTION:', reason)
+  console.error('Promise:', promise)
+})
+
 // Injected by esbuild at build time; fallback to reading package.json in dev mode
 declare const __APP_VERSION__: string
 const APP_VERSION = typeof __APP_VERSION__ !== 'undefined'
@@ -180,4 +191,12 @@ export async function bootstrap() {
   startVersionCheck()
 }
 
-bootstrap()
+// 添加 try-catch 来捕获启动错误
+try {
+  bootstrap()
+} catch (error) {
+  console.error('❌ FATAL ERROR during bootstrap:', error)
+  console.error('Error type:', (error as any)?.constructor?.name)
+  console.error('Error message:', (error as any)?.message)
+  process.exit(1)
+}

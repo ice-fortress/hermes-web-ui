@@ -1,5 +1,6 @@
 import { logger } from './logger'
 import { closeDb } from '../db'
+import { getGatewayManagerInstance } from './gateway-bootstrap'
 
 export function bindShutdown(server: any, groupChatServer?: any, chatRunServer?: any): void {
   let isShuttingDown = false
@@ -14,6 +15,17 @@ export function bindShutdown(server: any, groupChatServer?: any, chatRunServer?:
     logger.info('Shutting down (%s)...', signal)
 
     try {
+      // Stop all gateway processes first
+      try {
+        const gatewayManager = getGatewayManagerInstance()
+        if (gatewayManager) {
+          await gatewayManager.stopAll()
+          logger.info('All gateways stopped')
+        }
+      } catch (err) {
+        logger.warn(err, 'Failed to stop gateways (non-fatal)')
+      }
+
       // Close ChatRunSocket first to abort all active runs and close EventSource connections
       if (chatRunServer) {
         chatRunServer.close()

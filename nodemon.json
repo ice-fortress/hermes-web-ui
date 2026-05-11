@@ -1,0 +1,14 @@
+{
+  "watch": ["packages/server/src"],
+  "ext": "ts,tsx",
+  "execMap": {
+    "ts": "node -r ts-node/register"
+  },
+  "env": {
+    "TS_NODE_PROJECT": "packages/server/tsconfig.json",
+    "WINDOWS_KILL_HIDE_CONSOLE": "true"
+  },
+  "exec": "node -r ts-node/register packages/server/src/index.ts",
+  "nodeArgs": ["--no-warnings"],
+  "delay": "1000"
+}
