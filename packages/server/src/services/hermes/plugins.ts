@@ -244,7 +244,8 @@ function resolveHermesAgentRoot(): string {
     candidates.push(join(process.env.LOCALAPPDATA, 'hermes', 'hermes-agent'))
   }
 
-  return candidates.filter(Boolean).find(hasHermesPluginModule) || ''
+  return (candidates.filter(Boolean) as string[]).find(hasHermesPluginModule) || ''
+}
 }
 
 function pythonCandidates(agentRoot: string): string[] {
