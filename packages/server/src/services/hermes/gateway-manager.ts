@@ -365,14 +365,8 @@ export class GatewayManager {
       return { port: configuredPort, host }
     }
 
-    // 新增：即使没有 PID 文件，如果配置端口上有健康的网关运行，也认为是当前 profile 的网关
-    // 这解决了 nodemon 重启后内存清空但网关仍在运行的情况
-    if (await this.checkHealth(configuredUrl, 2000)) {
-      logger.info('Profile "%s" has healthy gateway on configured port %d (no PID file, assuming ownership)', name, configuredPort)
-      this.gateways.set(name, { pid: 0, port: configuredPort, host, url: configuredUrl, owned: false })
-      this.allocatedPorts.add(configuredPort)
-      return { port: configuredPort, host }
-    }
+    // 如果没有 PID 文件也没有内存记录，不认领端口上的未知网关
+    // 如果端口被占用，findFreePort 会分配新端口
 
     // 收集已占用端口：本次启动已分配的端口 + 其他 profile 的网关端口
     const usedPorts = new Set<number>(this.allocatedPorts)
@@ -480,15 +474,7 @@ export class GatewayManager {
       return { profile: name, port, host, url, running: true, pid }
     }
 
-    // 新增：即使没有 PID 文件，如果配置端口上有健康的网关运行，也认为是运行状态
-    // 这解决了 nodemon 重启后内存清空但网关仍在运行的情况
-    if (await this.checkHealth(url, 2000)) {
-      logger.info('DetectStatus: Profile "%s" has healthy gateway on port %d (no PID file)', name, port)
-      this.gateways.set(name, { pid: 0, port, host, url, owned: false })
-      return { profile: name, port, host, url, running: true, pid: 0 }
-    }
-
-    // 未运行或端口不匹配
+    // 没有 PID 文件时不认领端口上的未知网关，避免误判其他 profile 的网关
     this.gateways.delete(name)
     return { profile: name, port, host, url, running: false }
   }
