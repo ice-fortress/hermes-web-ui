@@ -10,8 +10,6 @@ services:
     stdin_open: true
     tty: true
     restart: unless-stopped
-    ports:
-      - "8642-8670:8642-8670"
 
   hermes-webui:
     build:
