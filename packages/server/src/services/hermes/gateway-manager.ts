@@ -147,6 +147,21 @@ function isLocalHost(host: string): boolean {
   return ['127.0.0.1', 'localhost', '::1', '[::1]', '0.0.0.0'].includes(host)
 }
 
+function shouldDetachGatewayProcess(): boolean {
+  // In dev mode (nodemon), always detach gateway processes so they survive restarts
+  // Production mode: attach gateways so they can be managed together with the server
+  const override = process.env.HERMES_WEB_UI_STOP_GATEWAYS_ON_SHUTDOWN?.trim().toLowerCase()
+  const shouldDetach = override === '0' || override === 'false'
+
+  if (shouldDetach) {
+    console.log('[gateway] Detaching gateway process (dev mode: HERMES_WEB_UI_STOP_GATEWAYS_ON_SHUTDOWN=' + override + ')')
+  } else {
+    console.log('[gateway] Attaching gateway process (prod mode: HERMES_WEB_UI_STOP_GATEWAYS_ON_SHUTDOWN=' + (override || 'not set') + ')')
+  }
+
+  return shouldDetach
+}
+
 // ============================
 // GatewayManager
 // ============================
@@ -200,15 +215,28 @@ export class GatewayManager {
     }
   }
 
-  /** 从 profile 的 gateway.pid 文件读取 PID（JSON 格式 { "pid": 12345 }） */
+  /** Read a profile gateway PID, falling back to runtime state when gateway.pid is missing. */
   private readPidFile(name: string): number | null {
-    const pidPath = join(this.profileDir(name), 'gateway.pid')
-    if (!existsSync(pidPath)) return null
+    const profilePath = this.profileDir(name)
+    const pidPath = join(profilePath, 'gateway.pid')
 
     try {
-      const content = readFileSync(pidPath, 'utf-8').trim()
+      if (existsSync(pidPath)) {
+        const content = readFileSync(pidPath, 'utf-8').trim()
+        const data = JSON.parse(content)
+        return typeof data.pid === 'number' ? data.pid : parseInt(data.pid, 10) || null
+      }
+    } catch {}
+
+    const statePath = join(profilePath, 'gateway_state.json')
+    if (!existsSync(statePath)) return null
+
+    try {
+      const content = readFileSync(statePath, 'utf-8').trim()
       const data = JSON.parse(content)
-      return typeof data.pid === 'number' ? data.pid : parseInt(data.pid, 10) || null
+      const pid = typeof data.pid === 'number' ? data.pid : parseInt(data.pid, 10) || null
+      const state = data?.gateway_state
+      return pid && Number.isFinite(pid) && pid > 0 && (state === 'running' || state === 'starting') ? pid : null
     } catch {
       return null
     }
@@ -218,13 +246,13 @@ export class GatewayManager {
   // 进程 & 端口检测工具
   // ============================
 
-  /** 检查进程是否存活（发送信号 0，不实际杀死进程） */
+  /** Check process liveness without sending a terminating signal. */
   private isProcessAlive(pid: number): boolean {
     try {
       process.kill(pid, 0)
       return true
-    } catch {
-      return false
+    } catch (err: any) {
+      return err?.code === 'EPERM'
     }
   }
 
@@ -547,18 +575,22 @@ export class GatewayManager {
       }
     }
 
-    // 所有平台统一使用 run 模式：子进程跟随父进程生命周期
+    // 所有平台统一使用 run 模式；dev/nodemon 可通过 env 保留 gateway 进程。
     return new Promise((resolve, reject) => {
       const env = { ...process.env, HERMES_HOME: hermesHome }
+      const detachGateway = shouldDetachGatewayProcess()
       const child = spawn(HERMES_BIN, ['gateway', 'run', '--replace'], {
         stdio: 'ignore',
+        detached: detachGateway,
         windowsHide: true,
         env,
       })
-      // 不使用 detached 和 unref，让子进程跟随父进程生命周期
+      if (detachGateway) {
+        child.unref()
+      }
 
       const pid = child.pid ?? 0
-      logger.info('Starting gateway for profile "%s" (run mode, PID: %d, port: %d)', name, pid, port)
+      logger.info('Starting gateway for profile "%s" (run mode, PID: %d, port: %d, detached: %s)', name, pid, port, detachGateway)
 
       // 保存子进程引用，用于后续管理
       this.gateways.set(name, { pid, port, host, url, owned: true, process: child })
