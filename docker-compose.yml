@@ -17,6 +17,7 @@ services:
       - PATH=/opt/hermes/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
       - AUTH_DISABLED=${AUTH_DISABLED:-false}
       - HERMES_ALLOW_ROOT_GATEWAY=1
+      - SEARXNG_URL=https://search.henryang.de
     restart: unless-stopped
     stdin_open: true
     tty: true
