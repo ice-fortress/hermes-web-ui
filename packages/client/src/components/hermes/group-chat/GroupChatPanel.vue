@@ -8,6 +8,7 @@ import { useProfilesStore } from '@/stores/hermes/profiles'
 import { updateRoomConfig, forceCompress } from '@/api/hermes/group-chat'
 import GroupMessageList from './GroupMessageList.vue'
 import GroupChatInput from './GroupChatInput.vue'
+import type { Attachment } from '@/stores/hermes/chat'
 
 const { t } = useI18n()
 const message = useMessage()
@@ -16,13 +17,17 @@ const profilesStore = useProfilesStore()
 
 const showSidebar = ref(window.innerWidth > 768)
 const showCreateModal = ref(false)
+const showCloneModal = ref(false)
 const showAddAgentModal = ref(false)
 const showCompressionModal = ref(false)
-const compressionConfig = ref({ triggerTokens: 100000, maxHistoryTokens: 32000, tailMessageCount: 20 })
+const compressionConfig = ref({ triggerTokens: 100000, maxHistoryTokens: 32000, tailMessageCount: 10 })
 const isCompressing = ref(false)
 const selectedProfile = ref<string | null>(null)
 const agentName = ref('')
 const agentDescription = ref('')
+const cloneSourceRoomId = ref<string | null>(null)
+const cloneRoomName = ref('')
+const cloneInviteCode = ref('')
 
 const profileOptions = computed(() =>
     profilesStore.profiles.map(p => ({ label: p.name, value: p.name }))
@@ -38,6 +43,7 @@ function agentAvatarUrl(name: string): string {
 }
 
 const hasRoom = computed(() => !!store.currentRoomId)
+const visibleApproval = computed(() => store.activePendingApproval)
 
 function formatTokens(tokens: number): string {
     if (tokens >= 1000) return `${(tokens / 1000).toFixed(1)}k tokens`
@@ -46,6 +52,15 @@ function formatTokens(tokens: number): string {
 
 function toggleSidebar() {
     showSidebar.value = !showSidebar.value
+}
+
+function generateCode(): string {
+    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
+    let code = ''
+    for (let i = 0; i < 6; i++) {
+        code += chars[Math.floor(Math.random() * chars.length)]
+    }
+    return code
 }
 
 async function handleCreateRoom(name: string, inviteCode: string, userName: string, description: string, compression: { triggerTokens: number; maxHistoryTokens: number; tailMessageCount: number }) {
@@ -69,6 +84,46 @@ async function handleDeleteRoom(roomId: string) {
     }
 }
 
+function handleOpenCloneRoom(roomId: string) {
+    const room = store.rooms.find(r => r.id === roomId)
+    cloneSourceRoomId.value = roomId
+    cloneRoomName.value = room?.name ? `${room.name} Copy` : ''
+    cloneInviteCode.value = generateCode()
+    showCloneModal.value = true
+}
+
+async function confirmCloneRoom() {
+    if (!cloneSourceRoomId.value || !cloneRoomName.value.trim()) return
+    try {
+        const res = await store.cloneRoom(cloneSourceRoomId.value, {
+            name: cloneRoomName.value.trim(),
+            inviteCode: cloneInviteCode.value.trim() || undefined,
+        })
+        showCloneModal.value = false
+        cloneSourceRoomId.value = null
+        cloneRoomName.value = ''
+        cloneInviteCode.value = ''
+        await store.joinRoom(res.room.id)
+        message.success(t('groupChat.roomCloned'))
+    } catch {
+        message.error(t('common.saveFailed'))
+    }
+}
+
+async function handleClearRoomContext() {
+    if (!store.currentRoomId) return
+    if (store.contextStatuses.size > 0) {
+        message.warning(t('groupChat.compressingInProgress'))
+        return
+    }
+    try {
+        await store.clearCurrentRoomContext()
+        message.success(t('groupChat.contextCleared'))
+    } catch {
+        message.error(t('common.deleteFailed'))
+    }
+}
+
 async function handleSelectRoom(roomId: string) {
     try {
         await store.joinRoom(roomId)
@@ -78,9 +133,9 @@ async function handleSelectRoom(roomId: string) {
     }
 }
 
-async function handleSendMessage(content: string) {
+async function handleSendMessage(content: string, attachments?: Attachment[]) {
     try {
-        await store.sendMessage(content)
+        await store.sendMessage(content, attachments)
     } catch (err: any) {
         message.error(err.message)
     }
@@ -119,7 +174,7 @@ function handleOpenCompressionConfig() {
         compressionConfig.value = {
             triggerTokens: room.triggerTokens ?? 100000,
             maxHistoryTokens: room.maxHistoryTokens ?? 32000,
-            tailMessageCount: room.tailMessageCount ?? 20,
+            tailMessageCount: room.tailMessageCount ?? 10,
         }
     }
     showCompressionModal.value = true
@@ -164,6 +219,22 @@ async function handleRemoveAgent(agentId: string) {
     }
 }
 
+async function handleInterruptAgent(agentName: string) {
+    try {
+        await store.interruptAgent(agentName)
+    } catch (err: any) {
+        message.error(err.message || t('common.saveFailed'))
+    }
+}
+
+async function handleApproval(choice: 'once' | 'session' | 'always' | 'deny') {
+    try {
+        await store.respondApproval(choice)
+    } catch (err: any) {
+        message.error(err.message || t('common.saveFailed'))
+    }
+}
+
 // Auto-scroll on new messages
 const messageListRef = ref()
 watch(() => store.sortedMessages.length, async () => {
@@ -204,9 +275,14 @@ watch(() => store.sortedMessages.length, async () => {
                         <span v-if="room.inviteCode" class="room-code">{{ room.inviteCode }}</span>
                         <span class="room-tokens">{{ formatTokens(room.totalTokens || 0) }}</span>
                     </div>
+                    <button class="room-action-btn" :title="t('groupChat.cloneRoom')" @click.stop="handleOpenCloneRoom(room.id)">
+                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <rect x="8" y="8" width="12" height="12" rx="2" /><path d="M4 16V6a2 2 0 0 1 2-2h10" />
+                        </svg>
+                    </button>
                     <NPopconfirm @positive-click="handleDeleteRoom(room.id)">
                         <template #trigger>
-                            <button class="room-delete-btn" @click.stop>
+                            <button class="room-action-btn danger" @click.stop>
                                 <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
                             </button>
                         </template>
@@ -281,6 +357,16 @@ watch(() => store.sortedMessages.length, async () => {
                     <button class="icon-btn" :title="t('groupChat.compressionConfig')" @click="handleOpenCompressionConfig">
                         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06A1.65 1.65 0 0 0 19.4 4.6a1.65 1.65 0 0 0 1.51 1V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1.51 1z"/></svg>
                     </button>
+                    <NPopconfirm @positive-click="handleClearRoomContext">
+                        <template #trigger>
+                            <button class="icon-btn" :title="t('groupChat.clearContext')">
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                                    <path d="M3 6h18" /><path d="M8 6V4h8v2" /><path d="M19 6l-1 14H6L5 6" /><path d="M10 11v5" /><path d="M14 11v5" />
+                                </svg>
+                            </button>
+                        </template>
+                        {{ t('groupChat.clearContextConfirm') }}
+                    </NPopconfirm>
                     <span v-if="store.members.length" class="member-count">
                         {{ store.members.length }} {{ t('groupChat.members') }}
                     </span>
@@ -302,6 +388,12 @@ watch(() => store.sortedMessages.length, async () => {
                             <span v-else>
                                 @{{ status.agentName }} {{ t('groupChat.agentReplying') }}
                             </span>
+                            <button class="context-stop-btn" :title="t('common.cancel')" @click="handleInterruptAgent(status.agentName)">
+                                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                                    <line x1="18" y1="6" x2="6" y2="18" />
+                                    <line x1="6" y1="6" x2="18" y2="18" />
+                                </svg>
+                            </button>
                         </div>
                     </div>
                     <div v-else-if="store.typingText" class="typing-indicator">
@@ -309,6 +401,38 @@ watch(() => store.sortedMessages.length, async () => {
                             <span /><span /><span />
                         </span>
                         {{ store.typingText }}
+                    </div>
+                </div>
+                <div v-if="visibleApproval" class="approval-bar">
+                    <div class="approval-icon" aria-hidden="true">
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10" />
+                            <path d="m9 12 2 2 4-4" />
+                        </svg>
+                    </div>
+                    <div class="approval-content">
+                        <div class="approval-main">
+                            <div class="approval-kicker">{{ t('chat.approvalKicker') }}</div>
+                            <div class="approval-title">
+                                <span v-if="visibleApproval.agentName">@{{ visibleApproval.agentName }} · </span>{{ t('chat.approvalTitle') }}
+                            </div>
+                            <div class="approval-desc">{{ visibleApproval.description }}</div>
+                            <code class="approval-command">{{ visibleApproval.command }}</code>
+                        </div>
+                        <div class="approval-actions">
+                            <NButton v-if="visibleApproval.choices.includes('once')" size="small" type="primary" @click="handleApproval('once')">
+                                {{ t('chat.approvalAllowOnce') }}
+                            </NButton>
+                            <NButton v-if="visibleApproval.choices.includes('session')" size="small" secondary @click="handleApproval('session')">
+                                {{ t('chat.approvalAllowSession') }}
+                            </NButton>
+                            <NButton v-if="visibleApproval.choices.includes('always')" size="small" secondary @click="handleApproval('always')">
+                                {{ t('chat.approvalAlways') }}
+                            </NButton>
+                            <NButton v-if="visibleApproval.choices.includes('deny')" size="small" type="error" secondary @click="handleApproval('deny')">
+                                {{ t('chat.approvalDeny') }}
+                            </NButton>
+                        </div>
                     </div>
                 </div>
                 <GroupChatInput @send="handleSendMessage" />
@@ -366,6 +490,40 @@ watch(() => store.sortedMessages.length, async () => {
                         <NSpace justify="end">
                             <NButton @click="showAddAgentModal = false">{{ t('common.cancel') }}</NButton>
                             <NButton type="primary" :disabled="!selectedProfile" @click="confirmAddAgent">{{ t('common.add') }}</NButton>
+                        </NSpace>
+                    </div>
+                </div>
+            </div>
+            <div v-if="showCloneModal" class="modal-backdrop" @click.self="showCloneModal = false">
+                <div class="modal">
+                    <h3>{{ t('groupChat.cloneRoom') }}</h3>
+                    <div class="form-group">
+                        <label class="form-label">{{ t('groupChat.roomName') }}</label>
+                        <NInput
+                            v-model:value="cloneRoomName"
+                            :placeholder="t('groupChat.roomNamePlaceholder')"
+                            @keyup.enter="confirmCloneRoom"
+                        />
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">{{ t('groupChat.inviteCode') }}</label>
+                        <div class="code-row">
+                            <NInput
+                                v-model:value="cloneInviteCode"
+                                :placeholder="t('groupChat.autoGenerate')"
+                                @keyup.enter="confirmCloneRoom"
+                            />
+                            <NButton size="small" @click="cloneInviteCode = generateCode()">
+                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                                    <polyline points="23 4 23 10 17 10" /><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10" />
+                                </svg>
+                            </NButton>
+                        </div>
+                    </div>
+                    <div class="modal-actions">
+                        <NSpace justify="end">
+                            <NButton @click="showCloneModal = false">{{ t('common.cancel') }}</NButton>
+                            <NButton type="primary" :disabled="!cloneRoomName.trim()" @click="confirmCloneRoom">{{ t('groupChat.cloneRoom') }}</NButton>
                         </NSpace>
                     </div>
                 </div>
@@ -483,6 +641,143 @@ export default defineComponent({ components: { CreateRoomForm } })
     }
 }
 
+.context-stop-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 20px;
+    height: 20px;
+    border: 1px solid rgba(var(--error-rgb), 0.18);
+    border-radius: $radius-sm;
+    background: rgba(var(--error-rgb), 0.06);
+    color: $error;
+    cursor: pointer;
+    padding: 0;
+    transition: color 0.15s ease, background 0.15s ease, border-color 0.15s ease;
+
+    &:hover {
+        color: #ffffff;
+        background: $error;
+        border-color: $error;
+    }
+}
+
+.approval-bar {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    margin: 0 16px 12px;
+    padding: 12px;
+    border: 1px solid $border-color;
+    border-radius: 8px;
+    background: $bg-card;
+    box-shadow: none;
+}
+
+.approval-icon {
+    display: grid;
+    place-items: center;
+    flex: 0 0 32px;
+    width: 32px;
+    height: 32px;
+    color: var(--accent-primary);
+    background: rgba(var(--accent-primary-rgb), 0.12);
+    border: 1px solid rgba(var(--accent-primary-rgb), 0.2);
+    border-radius: 8px;
+}
+
+.approval-content {
+    flex: 1;
+    min-width: 0;
+}
+
+.approval-main {
+    min-width: 0;
+}
+
+.approval-kicker {
+    margin-bottom: 2px;
+    font-size: 10px;
+    font-weight: 700;
+    line-height: 1.2;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--accent-primary);
+}
+
+.approval-title {
+    font-size: 14px;
+    font-weight: 700;
+    line-height: 1.3;
+    color: $text-primary;
+}
+
+.approval-desc {
+    margin-top: 4px;
+    font-size: 12px;
+    line-height: 1.45;
+    color: $text-secondary;
+}
+
+.approval-command {
+    display: block;
+    margin-top: 8px;
+    max-height: 96px;
+    overflow: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-family: "SFMono-Regular", "Cascadia Code", "Roboto Mono", Consolas, monospace;
+    font-size: 11px;
+    line-height: 1.45;
+    color: $text-primary;
+    background: $bg-secondary;
+    border: 1px solid $border-color;
+    border-radius: 6px;
+    padding: 8px 10px;
+}
+
+.approval-actions {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: 8px;
+    margin-top: 10px;
+    padding-top: 10px;
+    border-top: 1px solid $border-color;
+}
+
+@media (max-width: 768px) {
+    .approval-bar {
+        margin: 0 10px 10px;
+        padding: 10px;
+    }
+
+    .approval-icon {
+        flex-basis: 28px;
+        width: 28px;
+        height: 28px;
+    }
+
+    .approval-actions {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .approval-actions :deep(.n-button) {
+        width: 100%;
+    }
+}
+
+@media (max-width: 420px) {
+    .approval-bar {
+        gap: 8px;
+    }
+
+    .approval-actions {
+        grid-template-columns: 1fr;
+    }
+}
+
 .typing-indicator {
     display: flex;
     align-items: center;
@@ -597,7 +892,7 @@ export default defineComponent({ components: { CreateRoomForm } })
         color: $text-muted;
     }
 
-    .room-delete-btn {
+    .room-action-btn {
         flex-shrink: 0;
         display: flex;
         align-items: center;
@@ -613,12 +908,17 @@ export default defineComponent({ components: { CreateRoomForm } })
         transition: opacity $transition-fast, color $transition-fast, background-color $transition-fast;
 
         &:hover {
+            color: $text-primary;
+            background-color: rgba(var(--accent-primary-rgb), 0.08);
+        }
+
+        &.danger:hover {
             color: $error;
             background-color: rgba(var(--error-rgb), 0.1);
         }
     }
 
-    &:hover .room-delete-btn {
+    &:hover .room-action-btn {
         opacity: 1;
     }
 }
@@ -873,6 +1173,20 @@ export default defineComponent({ components: { CreateRoomForm } })
 
 .form-group {
     margin-bottom: 16px;
+}
+
+.form-label {
+    display: block;
+    font-size: 13px;
+    font-weight: 500;
+    color: $text-secondary;
+    margin-bottom: 6px;
+}
+
+.code-row {
+    display: flex;
+    gap: 8px;
+    align-items: center;
 }
 
 .modal-actions {

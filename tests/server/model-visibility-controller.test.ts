@@ -1,8 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-const { mockReadFile, mockReadConfigYaml, mockFetchProviderModels, mockBuildModelGroups, mockReadAppConfig, mockWriteAppConfig, mockExistsSync, mockReadFileSync } = vi.hoisted(() => ({
+const { mockReadFile, mockReadConfigYaml, mockReadConfigYamlForProfile, mockFetchProviderModels, mockBuildModelGroups, mockReadAppConfig, mockWriteAppConfig, mockExistsSync, mockReadFileSync } = vi.hoisted(() => ({
   mockReadFile: vi.fn(),
   mockReadConfigYaml: vi.fn(),
+  mockReadConfigYamlForProfile: vi.fn(),
   mockFetchProviderModels: vi.fn(),
   mockBuildModelGroups: vi.fn(() => ({ default: '', groups: [] })),
   mockReadAppConfig: vi.fn(),
@@ -23,15 +24,20 @@ vi.mock('fs', () => ({
 vi.mock('../../packages/server/src/services/hermes/hermes-profile', () => ({
   getActiveEnvPath: () => '/fake/home/.hermes/.env',
   getActiveAuthPath: () => '/fake/home/.hermes/auth.json',
+  getActiveProfileName: () => 'default',
+  getProfileDir: () => '/fake/home/.hermes',
+  listProfileNamesFromDisk: () => ['default'],
 }))
 
 vi.mock('../../packages/server/src/services/config-helpers', () => ({
   readConfigYaml: mockReadConfigYaml,
+  readConfigYamlForProfile: mockReadConfigYamlForProfile,
   writeConfigYaml: vi.fn(),
   fetchProviderModels: mockFetchProviderModels,
   buildModelGroups: mockBuildModelGroups,
   PROVIDER_ENV_MAP: {
     deepseek: { api_key_env: 'DEEPSEEK_API_KEY' },
+    'xai-oauth': { api_key_env: '', base_url_env: 'XAI_BASE_URL' },
     openrouter: {},
   },
 }))
@@ -39,6 +45,7 @@ vi.mock('../../packages/server/src/services/config-helpers', () => ({
 vi.mock('../../packages/server/src/shared/providers', () => ({
   buildProviderModelMap: () => ({
     deepseek: ['deepseek-chat', 'deepseek-reasoner'],
+    'xai-oauth': ['grok-4.3', 'grok-4.20-0309-reasoning'],
     openrouter: ['openrouter/auto'],
   }),
   PROVIDER_PRESETS: [
@@ -53,6 +60,12 @@ vi.mock('../../packages/server/src/shared/providers', () => ({
       label: 'OpenRouter',
       base_url: 'https://openrouter.ai/api/v1',
       models: ['openrouter/auto'],
+    },
+    {
+      value: 'xai-oauth',
+      label: 'xAI Grok OAuth (SuperGrok Subscription)',
+      base_url: 'https://api.x.ai/v1',
+      models: ['grok-4.3', 'grok-4.20-0309-reasoning'],
     },
   ],
 }))
@@ -85,6 +98,7 @@ beforeEach(() => {
   vi.clearAllMocks()
   mockReadFile.mockResolvedValue('DEEPSEEK_API_KEY=sk-test\n')
   mockReadConfigYaml.mockResolvedValue({ model: { default: 'deepseek-chat', provider: 'deepseek' } })
+  mockReadConfigYamlForProfile.mockResolvedValue({ model: { default: 'deepseek-chat', provider: 'deepseek' } })
   mockBuildModelGroups.mockReturnValue({ default: '', groups: [] })
   mockReadAppConfig.mockResolvedValue({})
   mockWriteAppConfig.mockImplementation(async patch => patch)
@@ -134,6 +148,30 @@ describe('models controller — model visibility', () => {
         label: 'OpenRouter',
         models: ['openrouter/auto'],
         available_models: ['openrouter/auto'],
+      }),
+    ]))
+  })
+
+  it('shows xAI Grok OAuth when SuperGrok credentials exist in auth.json', async () => {
+    mockExistsSync.mockReturnValue(true)
+    mockReadFileSync.mockReturnValue(JSON.stringify({
+      providers: {
+        'xai-oauth': {
+          tokens: { access_token: 'xai-token' },
+        },
+      },
+    }))
+
+    const ctx = makeCtx()
+    await ctrl.getAvailable(ctx)
+
+    expect(ctx.status).toBe(200)
+    expect(ctx.body.groups).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        provider: 'xai-oauth',
+        label: 'xAI Grok OAuth (SuperGrok Subscription)',
+        base_url: 'https://api.x.ai/v1',
+        models: ['grok-4.3', 'grok-4.20-0309-reasoning'],
       }),
     ]))
   })

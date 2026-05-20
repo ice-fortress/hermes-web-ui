@@ -7,7 +7,7 @@
  * - 用户自定义: HERMES_HOME 环境变量
  */
 
-import { resolve, join } from 'path'
+import { basename, dirname, isAbsolute, relative, resolve, join } from 'path'
 import { homedir } from 'os'
 
 /**
@@ -39,6 +39,20 @@ export function detectHermesHome(): string {
 }
 
 /**
+ * Detect the Hermes root data directory.
+ *
+ * `HERMES_HOME` may intentionally point at a profile directory when launching a
+ * specific gateway (`<root>/profiles/<name>`). Web UI profile management needs
+ * the root directory so it can read `active_profile` and enumerate profiles.
+ */
+export function detectHermesRootHome(): string {
+  const home = detectHermesHome()
+  const parent = dirname(home)
+  if (basename(parent) === 'profiles') return dirname(parent)
+  return home
+}
+
+/**
  * 获取 Hermes CLI 二进制文件路径
  * @param customBin 自定义的 hermes 二进制路径
  * @returns hermes 命令名称或路径
@@ -47,4 +61,21 @@ export function getHermesBin(customBin?: string): string {
   if (customBin?.trim()) return customBin.trim()
   if (process.env.HERMES_BIN?.trim()) return process.env.HERMES_BIN.trim()
   return 'hermes'
+}
+
+function comparablePath(path: string): string {
+  return process.platform === 'win32' ? path.toLowerCase() : path
+}
+
+export function isPathWithin(targetPath: string, basePath: string): boolean {
+  const base = resolve(basePath)
+  const target = resolve(targetPath)
+  const rel = relative(comparablePath(base), comparablePath(target))
+  return rel === '' || (!!rel && !rel.startsWith('..') && !isAbsolute(rel))
+}
+
+export function relativePathFromBase(targetPath: string, basePath: string): string | null {
+  if (!isPathWithin(targetPath, basePath)) return null
+  const rel = relative(resolve(basePath), resolve(targetPath))
+  return rel.replace(/\\/g, '/')
 }

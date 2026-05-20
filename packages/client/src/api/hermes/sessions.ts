@@ -2,8 +2,10 @@ import { request, getApiKey, getBaseUrlValue } from '../client'
 
 export interface SessionSummary {
   id: string
+  profile?: string
   source: string
   model: string
+  provider?: string
   title: string | null
   preview?: string
   started_at: number
@@ -36,7 +38,7 @@ export interface SessionSearchResult extends SessionSummary {
 export interface HermesMessage {
   id: number
   session_id: string
-  role: 'user' | 'assistant' | 'system' | 'tool'
+  role: 'user' | 'assistant' | 'system' | 'tool' | 'command'
   content: string
   tool_call_id: string | null
   tool_calls: any[] | null
@@ -47,10 +49,11 @@ export interface HermesMessage {
   reasoning: string | null
 }
 
-export async function fetchSessions(source?: string, limit?: number): Promise<SessionSummary[]> {
+export async function fetchSessions(source?: string, limit?: number, profile?: string): Promise<SessionSummary[]> {
   const params = new URLSearchParams()
   if (source) params.set('source', source)
   if (limit) params.set('limit', String(limit))
+  if (profile) params.set('profile', profile)
   const query = params.toString()
   const res = await request<{ sessions: SessionSummary[] }>(`/api/hermes/sessions${query ? `?${query}` : ''}`)
   return res.sessions
@@ -147,6 +150,18 @@ export async function setSessionWorkspace(id: string, workspace: string | null):
   }
 }
 
+export async function setSessionModel(id: string, model: string, provider: string): Promise<boolean> {
+  try {
+    await request(`/api/hermes/sessions/${id}/model`, {
+      method: 'POST',
+      body: JSON.stringify({ model, provider }),
+    })
+    return true
+  } catch {
+    return false
+  }
+}
+
 export async function exportSession(id: string, mode: 'full' | 'compressed' = 'full', ext: 'json' | 'txt' = 'json'): Promise<void> {
   const baseUrl = getBaseUrlValue()
   const token = getApiKey()
@@ -218,9 +233,11 @@ export async function fetchSessionUsageSingle(id: string): Promise<{ input_token
   }
 }
 
-export async function fetchContextLength(profile?: string): Promise<number> {
+export async function fetchContextLength(profile?: string, provider?: string, model?: string): Promise<number> {
   const params = new URLSearchParams()
   if (profile) params.set('profile', profile)
+  if (provider) params.set('provider', provider)
+  if (model) params.set('model', model)
   const query = params.toString()
   const res = await request<{ context_length: number }>(`/api/hermes/sessions/context-length${query ? `?${query}` : ''}`)
   return res.context_length

@@ -1,5 +1,5 @@
 import { io, type Socket } from 'socket.io-client'
-import { request, getBaseUrlValue, getApiKey } from '../client'
+import { getBaseUrlValue, getApiKey } from '../client'
 
 export type ContentBlock =
   | { type: 'text'; text: string }
@@ -16,6 +16,8 @@ export interface StartRunRequest {
   instructions?: string
   session_id?: string
   model?: string
+  provider?: string
+  model_groups?: Array<{ provider: string; models: string[] }>
   queue_id?: string
   source?: 'api_server' | 'cli'
 }
@@ -77,6 +79,7 @@ const sessionEventHandlers = new Map<string, {
   onAbortStarted: (event: RunEvent) => void
   onAbortCompleted: (event: RunEvent) => void
   onUsageUpdated: (event: RunEvent) => void
+  onSessionCommand?: (event: RunEvent) => void
   onRunQueued?: (event: RunEvent) => void
   onApprovalRequested?: (event: RunEvent) => void
   onApprovalResolved?: (event: RunEvent) => void
@@ -291,6 +294,16 @@ function globalUsageUpdatedHandler(event: RunEvent): void {
   }
 }
 
+function globalSessionCommandHandler(event: RunEvent): void {
+  const sid = event.session_id
+  if (!sid) return
+
+  const handlers = sessionEventHandlers.get(sid)
+  if (handlers?.onSessionCommand) {
+    handlers.onSessionCommand(event)
+  }
+}
+
 function globalApprovalRequestedHandler(event: RunEvent): void {
   const sid = event.session_id
   if (!sid) return
@@ -334,6 +347,7 @@ export function registerSessionHandlers(
     onAbortStarted: (event: RunEvent) => void
     onAbortCompleted: (event: RunEvent) => void
     onUsageUpdated: (event: RunEvent) => void
+    onSessionCommand?: (event: RunEvent) => void
     onRunQueued?: (event: RunEvent) => void
     onApprovalRequested?: (event: RunEvent) => void
     onApprovalResolved?: (event: RunEvent) => void
@@ -436,6 +450,7 @@ export function connectChatRun(): Socket {
 
     // Usage events
     chatRunSocket.on('usage.updated', globalUsageUpdatedHandler)
+    chatRunSocket.on('session.command', globalSessionCommandHandler)
 
     globalListenersRegistered = true
   }
@@ -565,6 +580,14 @@ export function startRunViaSocket(
       if (closed) return
       onEvent(evt)
     },
+    onSessionCommand: (evt: RunEvent) => {
+      if (closed) return
+      onEvent(evt)
+      if ((evt as any).terminal === false) return
+      closed = true
+      sessionEventHandlers.delete(sid)
+      onDone()
+    },
     onRunQueued: (evt: RunEvent) => {
       if (closed) return
       onEvent(evt)
@@ -592,8 +615,4 @@ export function startRunViaSocket(
       }
     },
   }
-}
-
-export async function fetchModels(): Promise<{ data: Array<{ id: string }> }> {
-  return request('/api/hermes/v1/models')
 }

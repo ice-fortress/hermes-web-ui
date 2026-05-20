@@ -45,11 +45,19 @@ export interface AvailableModelGroup {
   model_meta?: Record<string, { preview?: boolean; disabled?: boolean; alias?: string }>
 }
 
+export interface ProfileAvailableModels {
+  profile: string
+  default: string
+  default_provider: string
+  groups: AvailableModelGroup[]
+}
+
 export interface AvailableModelsResponse {
   default: string
   default_provider: string
   groups: AvailableModelGroup[]
   allProviders: AvailableModelGroup[]
+  profiles?: ProfileAvailableModels[]
   /** Web UI-only display aliases keyed by provider -> canonical model ID. */
   model_aliases?: Record<string, Record<string, string>>
   model_visibility?: ModelVisibility
@@ -76,8 +84,29 @@ export async function fetchConfigModels(): Promise<ConfigModelsResponse> {
   return request<ConfigModelsResponse>('/api/hermes/config/models')
 }
 
-export async function fetchAvailableModels(): Promise<AvailableModelsResponse> {
-  return request<AvailableModelsResponse>('/api/hermes/available-models')
+function currentProfileName(): string {
+  try {
+    return localStorage.getItem('hermes_active_profile_name') || 'default'
+  } catch {
+    return 'default'
+  }
+}
+
+export async function fetchAvailableModels(profile = currentProfileName()): Promise<AvailableModelsResponse> {
+  const params = new URLSearchParams()
+  params.set('profile', profile || 'default')
+  return request<AvailableModelsResponse>(`/api/hermes/available-models?${params.toString()}`)
+}
+
+export async function fetchProviderModels(data: {
+  base_url: string
+  api_key?: string
+  freeOnly?: boolean
+}): Promise<{ models: string[] }> {
+  return request<{ models: string[] }>('/api/hermes/provider-models', {
+    method: 'POST',
+    body: JSON.stringify(data),
+  })
 }
 
 export async function updateDefaultModel(data: {

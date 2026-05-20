@@ -11,16 +11,21 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
+import importlib.util
 import json
 import os
 import queue
 import shutil
 import socket
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlparse
@@ -34,6 +39,28 @@ DEFAULT_HERMES_HOME = "~/.hermes"
 
 def _bridge_platform() -> str:
     return os.environ.get("HERMES_AGENT_BRIDGE_PLATFORM", "cli").strip() or "cli"
+
+
+def _suppress_bridge_platform_hint() -> None:
+    raw = os.environ.get("HERMES_BRIDGE_SUPPRESS_PLATFORM_HINT", "cli").strip()
+    if raw.lower() in {"0", "false", "no", "off"}:
+        return
+    targets = {part.strip().lower() for part in raw.split(",") if part.strip()}
+    if not targets:
+        return
+    try:
+        from agent import prompt_builder
+
+        for target in targets:
+            prompt_builder.PLATFORM_HINTS.pop(target, None)
+    except Exception:
+        pass
+
+    run_agent_module = sys.modules.get("run_agent")
+    hints = getattr(run_agent_module, "PLATFORM_HINTS", None)
+    if isinstance(hints, dict):
+        for target in targets:
+            hints.pop(target, None)
 
 
 def _candidate_agent_roots(raw: str | None = None) -> list[Path]:
@@ -93,10 +120,17 @@ def _candidate_agent_roots(raw: str | None = None) -> list[Path]:
     return unique
 
 
-def _discover_agent_root(raw: str | None = None) -> Path:
+def _find_agent_root(raw: str | None = None) -> Path | None:
     for candidate in _candidate_agent_roots(raw):
         if (candidate / "run_agent.py").exists():
             return candidate
+    return None
+
+
+def _discover_agent_root(raw: str | None = None) -> Path:
+    root = _find_agent_root(raw)
+    if root is not None:
+        return root
     attempted = ", ".join(str(path) for path in _candidate_agent_roots(raw))
     raise RuntimeError(
         "hermes-agent run_agent.py not found. Pass --agent-root or set "
@@ -113,6 +147,12 @@ def _discover_hermes_home(raw: str | None = None) -> Path:
     return Path(DEFAULT_HERMES_HOME).expanduser().resolve()
 
 
+def _normalize_base_home(home: Path) -> Path:
+    if home.parent.name == "profiles":
+        return home.parent.parent
+    return home
+
+
 def _jsonable(value: Any) -> Any:
     try:
         json.dumps(value)
@@ -125,8 +165,8 @@ def _jsonable(value: Any) -> Any:
         return str(value)
 
 
-def _agent_root() -> Path:
-    return _discover_agent_root(os.environ.get("HERMES_AGENT_ROOT"))
+def _agent_root() -> Path | None:
+    return _find_agent_root(os.environ.get("HERMES_AGENT_ROOT"))
 
 
 def _hermes_home() -> Path:
@@ -134,7 +174,12 @@ def _hermes_home() -> Path:
 
 
 def _base_hermes_home() -> Path:
-    return _discover_hermes_home(os.environ.get("HERMES_AGENT_BRIDGE_BASE_HOME") or DEFAULT_HERMES_HOME)
+    return _normalize_base_home(_discover_hermes_home(os.environ.get("HERMES_AGENT_BRIDGE_BASE_HOME") or DEFAULT_HERMES_HOME))
+
+
+def _worker_profile() -> str | None:
+    raw = os.environ.get("HERMES_AGENT_BRIDGE_WORKER_PROFILE", "").strip()
+    return raw or None
 
 
 def _profile_home(profile: str | None) -> Path:
@@ -145,20 +190,68 @@ def _profile_home(profile: str | None) -> Path:
     return profile_home if profile_home.exists() else base
 
 
+def _read_dotenv(path: Path) -> dict[str, str]:
+    if not path.exists():
+        return {}
+    values: dict[str, str] = {}
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or "=" not in stripped:
+                continue
+            if stripped.startswith("export "):
+                stripped = stripped[7:].strip()
+            key, value = stripped.split("=", 1)
+            key = key.strip()
+            if not key or not (key[0].isalpha() or key[0] == "_"):
+                continue
+            if not all(ch.isalnum() or ch == "_" for ch in key):
+                continue
+            value = value.strip()
+            if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
+                value = value[1:-1]
+            values[key] = value
+        return values
+    except Exception:
+        return {}
+
+
+def _profile_dotenv_keys() -> set[str]:
+    base = _base_hermes_home()
+    keys = set(_read_dotenv(base / ".env").keys())
+    profiles_dir = base / "profiles"
+    try:
+        for entry in profiles_dir.iterdir():
+            if entry.is_dir():
+                keys.update(_read_dotenv(entry / ".env").keys())
+    except Exception:
+        pass
+    return keys
+
+
 def _set_path_env(agent_root: str | None = None, hermes_home: str | None = None) -> None:
-    os.environ["HERMES_AGENT_ROOT"] = str(_discover_agent_root(agent_root))
-    resolved_home = str(_discover_hermes_home(hermes_home))
-    os.environ["HERMES_HOME"] = resolved_home
-    os.environ["HERMES_AGENT_BRIDGE_BASE_HOME"] = resolved_home
+    resolved_root = _discover_agent_root(agent_root) if agent_root else _find_agent_root()
+    if resolved_root is not None:
+        os.environ["HERMES_AGENT_ROOT"] = str(resolved_root)
+    else:
+        os.environ.pop("HERMES_AGENT_ROOT", None)
+    resolved_home = _discover_hermes_home(hermes_home)
+    os.environ["HERMES_HOME"] = str(resolved_home)
+    os.environ["HERMES_AGENT_BRIDGE_BASE_HOME"] = str(_normalize_base_home(resolved_home))
 
 
 def _ensure_agent_imports() -> None:
     root = _agent_root()
-    if not (root / "run_agent.py").exists():
-        raise RuntimeError(f"hermes-agent run_agent.py not found under {root}")
-    root_s = str(root)
-    if root_s not in sys.path:
-        sys.path.insert(0, root_s)
+    if root is not None:
+        root_s = str(root)
+        if root_s not in sys.path:
+            sys.path.insert(0, root_s)
+    elif importlib.util.find_spec("run_agent") is None:
+        raise RuntimeError(
+            "hermes-agent run_agent.py not found in source locations and the "
+            "current Python environment cannot import run_agent. Install "
+            "hermes-agent or pass --agent-root/HERMES_AGENT_ROOT."
+        )
     os.environ.setdefault("HERMES_HOME", str(_hermes_home()))
     os.environ.setdefault("HERMES_AGENT_BRIDGE_BASE_HOME", str(_hermes_home()))
 
@@ -186,8 +279,6 @@ def _apply_profile_env(profile: str | None) -> str | None:
     """Temporarily set HERMES_HOME to the profile directory.
     Returns the original HERMES_HOME value to restore later.
     """
-    if not profile or profile == "default":
-        return os.environ.get("HERMES_HOME")
     profile_home = _profile_home(profile)
     if not (profile_home / "config.yaml").exists():
         return os.environ.get("HERMES_HOME")
@@ -202,6 +293,61 @@ def _restore_profile_env(original: str | None) -> None:
         os.environ["HERMES_HOME"] = original
     else:
         os.environ.pop("HERMES_HOME", None)
+
+
+def _apply_profile_dotenv(profile: str | None) -> dict[str, str | None]:
+    """Load only the active profile's .env into this bridge process.
+
+    This mirrors Web UI gateway env isolation:
+    - default keeps inherited env for compatibility, then overlays default .env
+    - non-default clears keys seen in any profile .env, then overlays its .env
+    The returned snapshot restores the bridge process after the agent call.
+    """
+    values = _read_dotenv(_profile_home(profile) / ".env")
+    if profile and profile != "default":
+        keys = _profile_dotenv_keys()
+        keys.update(values.keys())
+    else:
+        keys = set(values.keys())
+    snapshot = {key: os.environ.get(key) for key in keys}
+
+    if profile and profile != "default":
+        for key in keys:
+            os.environ.pop(key, None)
+    for key, value in values.items():
+        os.environ[key] = value
+    return snapshot
+
+
+def _restore_profile_dotenv(snapshot: dict[str, str | None]) -> None:
+    for key, value in snapshot.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+
+
+def _set_worker_profile_env(profile: str | None) -> None:
+    profile_home = _profile_home(profile)
+    os.environ["HERMES_HOME"] = str(profile_home)
+    os.environ["HERMES_AGENT_BRIDGE_WORKER_PROFILE"] = profile or "default"
+    values = _read_dotenv(profile_home / ".env")
+    for key, value in values.items():
+        os.environ[key] = value
+
+
+@contextmanager
+def _profile_env(profile: str | None):
+    if _worker_profile():
+        yield
+        return
+    original = _apply_profile_env(profile)
+    env_snapshot = _apply_profile_dotenv(profile)
+    try:
+        yield
+    finally:
+        _restore_profile_dotenv(env_snapshot)
+        _restore_profile_env(original)
 
 
 def _resolve_model(cfg: dict[str, Any]) -> str:
@@ -353,20 +499,31 @@ class AgentPool:
         self._sessions: dict[str, AgentSession] = {}
         self._runs: dict[str, RunRecord] = {}
         self._lock = threading.RLock()
+        self._run_lock = threading.Lock()
         self._db = SessionDbHolder()
         self._approval_requests: dict[str, queue.Queue[str]] = {}
+        self._gateway_approval_requests: dict[str, str] = {}
         self._compression_requests: dict[str, queue.Queue[dict[str, Any]]] = {}
 
     def get_or_create(
         self,
         session_id: str,
         profile: str | None = None,
+        model: str | None = None,
+        provider: str | None = None,
     ) -> AgentSession:
+        requested_model = str(model or "").strip()
+        requested_provider = str(provider or "").strip()
         with self._lock:
             existing = self._sessions.get(session_id)
             if existing is not None:
                 # If profile changed, destroy old session and recreate
-                if profile and existing.config.get("profile") != profile:
+                config_changed = bool(
+                    (profile and existing.config.get("profile") != profile)
+                    or (requested_model and existing.config.get("model") != requested_model)
+                    or (requested_provider and existing.config.get("provider") != requested_provider)
+                )
+                if config_changed:
                     if not existing.running:
                         self._destroy_session(session_id)
                     else:
@@ -377,13 +534,13 @@ class AgentPool:
                     return existing
 
             _ensure_agent_imports()
+            _suppress_bridge_platform_hint()
             from run_agent import AIAgent
 
-            original_home = _apply_profile_env(profile)
-            try:
+            with _profile_env(profile):
                 cfg = _load_cfg()
-                resolved_model = _resolve_model(cfg)
-                runtime = _resolve_runtime(resolved_model)
+                resolved_model = requested_model or _resolve_model(cfg)
+                runtime = _resolve_runtime(resolved_model, requested_provider or None)
                 agent_cfg = cfg.get("agent") or {}
                 prompt = str(agent_cfg.get("system_prompt", "") or "").strip() or None
 
@@ -397,7 +554,6 @@ class AgentPool:
                     acp_command=runtime.get("command"),
                     acp_args=runtime.get("args"),
                     credential_pool=runtime.get("credential_pool"),
-                    default_headers=runtime.get("default_headers"),
                     quiet_mode=True,
                     verbose_logging=False,
                     reasoning_config=_load_reasoning_config(),
@@ -436,8 +592,6 @@ class AgentPool:
                 )
                 self._sessions[session_id] = session
                 return session
-            finally:
-                _restore_profile_env(original_home)
 
     def _install_compression_hook(self, agent: Any, session_id: str) -> None:
         original = getattr(agent, "_compress_context", None)
@@ -673,14 +827,35 @@ class AgentPool:
 
         return callback
 
+    def _gateway_approval_notify(self, session_id: str):
+        def callback(approval_data: dict[str, Any]) -> None:
+            approval_id = uuid.uuid4().hex
+            choices = ["once", "session", "always", "deny"]
+            with self._lock:
+                self._gateway_approval_requests[approval_id] = session_id
+            self._append_event(session_id, {
+                "event": "approval.requested",
+                "approval_id": approval_id,
+                "command": str(approval_data.get("command") or ""),
+                "description": str(approval_data.get("description") or ""),
+                "choices": choices,
+                "allow_permanent": True,
+                "timeout_ms": 300_000,
+            })
+
+        return callback
+
     def _prepersist_user_message(
         self,
         session: AgentSession,
         message: Any,
+        storage_message: Any | None,
         conversation_history: list[dict[str, Any]] | None,
         profile: str | None,
+        source: str | None = None,
     ) -> bool:
-        user_content = str(message) if not isinstance(message, dict) else str(message.get("content", message))
+        persist_message = storage_message if storage_message is not None else message
+        user_content = str(persist_message) if not isinstance(persist_message, dict) else str(persist_message.get("content", persist_message))
         if not user_content.strip():
             return False
 
@@ -688,11 +863,13 @@ class AgentPool:
         if db is None:
             return False
 
+        history_len = len(conversation_history) if conversation_history else 0
+
         try:
             if hasattr(db, "create_session"):
                 db.create_session(
                     session_id=session.session_id,
-                    source=_bridge_platform(),
+                    source=source or _bridge_platform(),
                     model=session.config.get("model"),
                 )
 
@@ -701,6 +878,7 @@ class AgentPool:
                 if messages:
                     last = messages[-1]
                     if last.get("role") == "user" and last.get("content") == user_content:
+                        self._align_prepersist_flush_cursor(session, history_len)
                         return False
 
             db.append_message(
@@ -710,30 +888,100 @@ class AgentPool:
             )
 
             # AIAgent will build messages as conversation_history + current user.
-            # Since the current user was pre-persisted above, advance its flush
-            # cursor so the normal end-of-turn flush only writes assistant/tool
-            # messages for this turn.
-            history_len = len(conversation_history) if conversation_history else 0
-            try:
-                session.agent._last_flushed_db_idx = max(
-                    int(getattr(session.agent, "_last_flushed_db_idx", 0) or 0),
-                    history_len + 1,
-                )
-            except Exception:
-                pass
+            # Since the current user was pre-persisted above, align the flush
+            # cursor so the normal end-of-turn flush starts at assistant/tool
+            # messages generated by this run.
+            self._align_prepersist_flush_cursor(session, history_len)
             return True
         except Exception:
             return False
+
+    def _align_prepersist_flush_cursor(self, session: AgentSession, history_len: int) -> None:
+        try:
+            session.agent._last_flushed_db_idx = history_len + 1
+        except Exception:
+            pass
+
+    def _session_db_message_count(self, session_id: str, profile: str | None) -> int | None:
+        db = self._db.get_for_profile(profile)
+        if db is None or not hasattr(db, "get_messages"):
+            return None
+        try:
+            return len(db.get_messages(session_id) or [])
+        except Exception:
+            return None
+
+    def _sync_result_tail_to_session_db(
+        self,
+        session: AgentSession,
+        result: dict[str, Any],
+        conversation_history: list[dict[str, Any]] | None,
+        profile: str | None,
+        db_count_after_prepersist: int | None,
+    ) -> None:
+        db = self._db.get_for_profile(profile)
+        if db is None or db_count_after_prepersist is None:
+            return
+
+        after_count = self._session_db_message_count(session.session_id, profile)
+        if after_count is None or after_count > db_count_after_prepersist:
+            return
+
+        messages = result.get("messages")
+        if not isinstance(messages, list):
+            return
+
+        history_len = len(conversation_history) if conversation_history else 0
+        generated = [
+            msg for msg in messages[history_len + 1:]
+            if isinstance(msg, dict) and msg.get("role") in {"assistant", "tool"}
+        ]
+        if not generated:
+            return
+
+        appended = 0
+        for msg in generated:
+            try:
+                db.append_message(
+                    session_id=session.session_id,
+                    role=str(msg.get("role") or "assistant"),
+                    content=msg.get("content"),
+                    tool_name=msg.get("tool_name"),
+                    tool_calls=msg.get("tool_calls") if isinstance(msg.get("tool_calls"), list) else None,
+                    tool_call_id=msg.get("tool_call_id"),
+                    finish_reason=msg.get("finish_reason"),
+                    reasoning=msg.get("reasoning") if msg.get("role") == "assistant" else None,
+                    reasoning_content=msg.get("reasoning_content") if msg.get("role") == "assistant" else None,
+                    reasoning_details=msg.get("reasoning_details") if msg.get("role") == "assistant" else None,
+                    codex_reasoning_items=msg.get("codex_reasoning_items") if msg.get("role") == "assistant" else None,
+                    codex_message_items=msg.get("codex_message_items") if msg.get("role") == "assistant" else None,
+                )
+                appended += 1
+            except Exception:
+                break
+
+        if appended:
+            print(
+                "[hermes_bridge] synced missing result tail to session db "
+                f"session={session.session_id} appended={appended}",
+                file=sys.stderr,
+                flush=True,
+            )
 
     def start_chat(
         self,
         session_id: str,
         message: Any,
+        storage_message: Any | None = None,
         instructions: str | None = None,
         conversation_history: list[dict[str, Any]] | None = None,
         profile: str | None = None,
+        force_compress: bool = False,
+        model: str | None = None,
+        provider: str | None = None,
+        source: str | None = None,
     ) -> RunRecord:
-        session = self.get_or_create(session_id, profile=profile)
+        session = self.get_or_create(session_id, profile=profile, model=model, provider=provider)
         with session.lock:
             if session.running:
                 raise RuntimeError(f"session {session_id} is already running")
@@ -747,82 +995,110 @@ class AgentPool:
 
         thread = threading.Thread(
             target=self._run_chat,
-            args=(session, record, message, instructions, conversation_history, profile),
+            args=(session, record, message, storage_message, instructions, conversation_history, profile, force_compress, source),
             daemon=True,
             name=f"hermes-bridge-run-{run_id[:8]}",
         )
         thread.start()
         return record
 
-    def _run_chat(self, session: AgentSession, record: RunRecord, message: Any, instructions: str | None = None, conversation_history: list[dict[str, Any]] | None = None, profile: str | None = None) -> None:
-        def stream_callback(delta: str) -> None:
-            with self._lock:
-                record.deltas.append(str(delta))
+    def _run_chat(self, session: AgentSession, record: RunRecord, message: Any, storage_message: Any | None = None, instructions: str | None = None, conversation_history: list[dict[str, Any]] | None = None, profile: str | None = None, force_compress: bool = False, source: str | None = None) -> None:
+        with self._run_lock:
+            with _profile_env(profile):
+                def stream_callback(delta: str) -> None:
+                    with self._lock:
+                        record.deltas.append(str(delta))
 
-        try:
-            previous_approval_callback = None
-            previous_exec_ask = os.environ.get("HERMES_EXEC_ASK")
-            approval_session_token = None
-            try:
-                from tools.terminal_tool import _get_approval_callback, set_approval_callback
-                from tools.approval import set_current_session_key
-
-                previous_approval_callback = _get_approval_callback()
-                set_approval_callback(self._approval_callback(session.session_id))
-                approval_session_token = set_current_session_key(session.session_id)
-                os.environ["HERMES_EXEC_ASK"] = "1"
-            except Exception:
-                previous_approval_callback = None
-            self._prepersist_user_message(session, message, conversation_history, profile)
-            kwargs: dict[str, Any] = dict(
-                task_id=session.session_id,
-                stream_callback=stream_callback,
-            )
-            if instructions:
-                kwargs["system_message"] = instructions
-            if conversation_history is not None:
-                kwargs["conversation_history"] = conversation_history
-            result = session.agent.run_conversation(
-                message,
-                **kwargs,
-            )
-            result = _jsonable(result if isinstance(result, dict) else {"value": result})
-            with session.lock:
-                if isinstance(result.get("messages"), list):
-                    session.history = result["messages"]
-                record.status = "interrupted" if result.get("interrupted") else "complete"
-                record.result = result
-                record.ended_at = time.time()
-                session.running = False
-                session.current_run_id = None
-                session.last_used_at = time.time()
-        except Exception as exc:
-            with session.lock:
-                record.status = "error"
-                record.error = str(exc)
-                record.result = {"error": str(exc), "traceback": traceback.format_exc()}
-                record.ended_at = time.time()
-                session.running = False
-                session.current_run_id = None
-                session.last_used_at = time.time()
-        finally:
-            try:
-                from tools.terminal_tool import set_approval_callback
-
-                set_approval_callback(previous_approval_callback)
-            except Exception:
-                pass
-            if approval_session_token is not None:
                 try:
-                    from tools.approval import reset_current_session_key
+                    previous_approval_callback = None
+                    previous_exec_ask = os.environ.get("HERMES_EXEC_ASK")
+                    approval_session_token = None
+                    registered_gateway_approval_session = None
+                    try:
+                        from tools.terminal_tool import _get_approval_callback, set_approval_callback
+                        from tools.approval import register_gateway_notify, set_current_session_key
 
-                    reset_current_session_key(approval_session_token)
-                except Exception:
-                    pass
-            if previous_exec_ask is None:
-                os.environ.pop("HERMES_EXEC_ASK", None)
-            else:
-                os.environ["HERMES_EXEC_ASK"] = previous_exec_ask
+                        previous_approval_callback = _get_approval_callback()
+                        set_approval_callback(self._approval_callback(session.session_id))
+                        approval_session_token = set_current_session_key(session.session_id)
+                        register_gateway_notify(session.session_id, self._gateway_approval_notify(session.session_id))
+                        registered_gateway_approval_session = session.session_id
+                        os.environ["HERMES_EXEC_ASK"] = "1"
+                    except Exception:
+                        previous_approval_callback = None
+                    self._prepersist_user_message(session, message, storage_message, conversation_history, profile, source)
+                    db_count_after_prepersist = self._session_db_message_count(session.session_id, profile)
+                    if force_compress:
+                        compress = getattr(session.agent, "_compress_context", None)
+                        if callable(compress):
+                            compressed_history, compressed_system = compress(
+                                conversation_history if isinstance(conversation_history, list) else [],
+                                instructions,
+                                approx_tokens=None,
+                                focus_topic="debug_force_compress",
+                            )
+                            if isinstance(compressed_history, list):
+                                conversation_history = compressed_history
+                            if isinstance(compressed_system, str):
+                                instructions = compressed_system
+                    kwargs: dict[str, Any] = dict(
+                        task_id=session.session_id,
+                        stream_callback=stream_callback,
+                    )
+                    if instructions:
+                        kwargs["system_message"] = instructions
+                    if conversation_history is not None:
+                        kwargs["conversation_history"] = conversation_history
+                    result = session.agent.run_conversation(
+                        message,
+                        **kwargs,
+                    )
+                    result = _jsonable(result if isinstance(result, dict) else {"value": result})
+                    self._sync_result_tail_to_session_db(
+                        session,
+                        result,
+                        conversation_history,
+                        profile,
+                        db_count_after_prepersist,
+                    )
+                    with session.lock:
+                        if isinstance(result.get("messages"), list):
+                            session.history = result["messages"]
+                        record.status = "interrupted" if result.get("interrupted") else "complete"
+                        record.result = result
+                        record.ended_at = time.time()
+                        session.running = False
+                        session.current_run_id = None
+                        session.last_used_at = time.time()
+                except Exception as exc:
+                    with session.lock:
+                        record.status = "error"
+                        record.error = str(exc)
+                        record.result = {"error": str(exc), "traceback": traceback.format_exc()}
+                        record.ended_at = time.time()
+                        session.running = False
+                        session.current_run_id = None
+                        session.last_used_at = time.time()
+                finally:
+                    try:
+                        from tools.terminal_tool import set_approval_callback
+
+                        set_approval_callback(previous_approval_callback)
+                    except Exception:
+                        pass
+                    if approval_session_token is not None:
+                        try:
+                            from tools.approval import reset_current_session_key, unregister_gateway_notify
+
+                            if registered_gateway_approval_session is not None:
+                                unregister_gateway_notify(registered_gateway_approval_session)
+                            reset_current_session_key(approval_session_token)
+                        except Exception:
+                            pass
+                    if previous_exec_ask is None:
+                        os.environ.pop("HERMES_EXEC_ASK", None)
+                    else:
+                        os.environ["HERMES_EXEC_ASK"] = previous_exec_ask
 
     def interrupt(self, session_id: str, message: str | None = None) -> dict[str, Any]:
         with self._lock:
@@ -832,7 +1108,15 @@ class AgentPool:
         if not hasattr(session.agent, "interrupt"):
             raise RuntimeError("agent does not support interrupt")
         session.agent.interrupt(message)
-        return {"status": "interrupted", "session_id": session_id}
+        deadline = time.time() + 10.0
+        synced = False
+        while time.time() < deadline:
+            with session.lock:
+                if not session.running:
+                    synced = True
+                    break
+            time.sleep(0.05)
+        return {"status": "interrupted", "session_id": session_id, "synced": synced}
 
     def steer(self, session_id: str, text: str) -> dict[str, Any]:
         with self._lock:
@@ -851,7 +1135,22 @@ class AgentPool:
         with self._lock:
             response_queue = self._approval_requests.get(approval_id)
         if response_queue is None:
-            return {"approval_id": approval_id, "resolved": False, "choice": cleaned}
+            with self._lock:
+                gateway_session_id = self._gateway_approval_requests.pop(approval_id, None)
+            if gateway_session_id is None:
+                return {"approval_id": approval_id, "resolved": False, "choice": cleaned}
+            try:
+                from tools.approval import resolve_gateway_approval
+
+                resolved = resolve_gateway_approval(gateway_session_id, cleaned) > 0
+            except Exception:
+                resolved = False
+            self._append_event(gateway_session_id, {
+                "event": "approval.resolved",
+                "approval_id": approval_id,
+                "choice": cleaned,
+            })
+            return {"approval_id": approval_id, "resolved": resolved, "choice": cleaned}
         try:
             response_queue.put_nowait(cleaned)
         except queue.Full:
@@ -988,15 +1287,36 @@ class BridgeServer:
             raise ValueError("action is required")
 
         if action == "ping":
-            return {"pong": True, "time": time.time(), "agent_root": str(_agent_root())}
+            return {
+                "pong": True,
+                "time": time.time(),
+                "agent_root": str(_agent_root()),
+                "profile": _worker_profile() or "default",
+                "hermes_home": str(_hermes_home()),
+            }
 
         if action == "chat":
             session_id = str(req.get("session_id") or "").strip() or uuid.uuid4().hex
             message = req.get("message", req.get("input", ""))
+            storage_message = req.get("storage_message")
             instructions = req.get("instructions") or req.get("system_message")
             conversation_history = req.get("conversation_history")
             profile = req.get("profile")
-            record = self.pool.start_chat(session_id, message, instructions, conversation_history, profile)
+            model = req.get("model")
+            provider = req.get("provider")
+            source = req.get("source")
+            record = self.pool.start_chat(
+                session_id,
+                message,
+                storage_message,
+                instructions,
+                conversation_history,
+                profile,
+                bool(req.get("force_compress")),
+                model,
+                provider,
+                source,
+            )
             if req.get("wait"):
                 timeout = float(req.get("timeout", 0) or 0)
                 deadline = time.time() + timeout if timeout > 0 else None
@@ -1065,50 +1385,13 @@ class BridgeServer:
         raise ValueError(f"unknown action: {action}")
 
     def _make_server_socket(self) -> socket.socket:
-        if self.endpoint.startswith("ipc://"):
-            if not hasattr(socket, "AF_UNIX"):
-                raise RuntimeError("ipc:// endpoints require Unix domain socket support; use tcp://host:port on this platform")
-            sock_path = Path(self.endpoint.removeprefix("ipc://"))
-            sock_path.parent.mkdir(parents=True, exist_ok=True)
-            try:
-                sock_path.unlink(missing_ok=True)
-            except OSError:
-                pass
-            server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            server.bind(str(sock_path))
-            return server
-
-        parsed = urlparse(self.endpoint)
-        if parsed.scheme != "tcp":
-            raise RuntimeError(f"unsupported endpoint scheme: {self.endpoint}")
-        host = parsed.hostname or "127.0.0.1"
-        port = int(parsed.port or 0)
-        if port <= 0:
-            raise RuntimeError(f"tcp endpoint requires a port: {self.endpoint}")
-        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server.bind((host, port))
-        return server
+        return _make_listen_socket(self.endpoint)
 
     def _read_request(self, conn: socket.socket) -> dict[str, Any]:
-        chunks: list[bytes] = []
-        while True:
-            chunk = conn.recv(65536)
-            if not chunk:
-                break
-            chunks.append(chunk)
-            if b"\n" in chunk:
-                break
-        if not chunks:
-            raise RuntimeError("empty request")
-        line = b"".join(chunks).split(b"\n", 1)[0].strip()
-        if not line:
-            raise RuntimeError("empty request")
-        return json.loads(line.decode("utf-8"))
+        return _read_json_request(conn)
 
     def _write_response(self, conn: socket.socket, resp: dict[str, Any]) -> None:
-        payload = json.dumps(resp, ensure_ascii=False, default=str) + "\n"
-        conn.sendall(payload.encode("utf-8"))
+        _write_json_response(conn, resp)
 
     def _gc_idle_sessions(self) -> None:
         """Destroy sessions idle longer than IDLE_TIMEOUT_SECONDS."""
@@ -1168,16 +1451,607 @@ class BridgeServer:
                 pass
 
 
+class WorkerProcess:
+    STARTUP_TIMEOUT_SECONDS = 120
+    REQUEST_TIMEOUT_SECONDS = 120
+
+    def __init__(self, profile: str, endpoint: str, agent_root: str | None, hermes_home: str | None) -> None:
+        self.profile = profile or "default"
+        self.endpoint = endpoint
+        self.agent_root = agent_root
+        self.hermes_home = hermes_home
+        self.process: subprocess.Popen[str] | None = None
+        self.last_used_at = time.time()
+        self._lock = threading.RLock()
+
+    @property
+    def running(self) -> bool:
+        return self.process is not None and self.process.poll() is None
+
+    def start(self) -> None:
+        with self._lock:
+            if self.running:
+                return
+            args = [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "--endpoint",
+                self.endpoint,
+                "--worker-profile",
+                self.profile,
+            ]
+            if self.agent_root:
+                args.extend(["--agent-root", self.agent_root])
+            if self.hermes_home:
+                args.extend(["--hermes-home", self.hermes_home])
+
+            env = {
+                **os.environ,
+                "HERMES_AGENT_BRIDGE_ENDPOINT": self.endpoint,
+                "HERMES_AGENT_BRIDGE_WORKER_PROFILE": self.profile,
+            }
+            self.process = subprocess.Popen(
+                args,
+                env=env,
+                cwd=os.getcwd(),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+            )
+            self._pipe_stderr()
+            self._wait_ready()
+
+    def _pipe_stderr(self) -> None:
+        proc = self.process
+        if proc is None or proc.stderr is None:
+            return
+
+        def run() -> None:
+            assert proc.stderr is not None
+            for line in proc.stderr:
+                text = line.rstrip()
+                if text:
+                    print(f"[hermes-bridge-worker:{self.profile}] {text}", file=sys.stderr, flush=True)
+
+        threading.Thread(target=run, daemon=True, name=f"hermes-bridge-worker-stderr-{self.profile}").start()
+
+    def _wait_ready(self) -> None:
+        proc = self.process
+        if proc is None or proc.stdout is None:
+            raise RuntimeError(f"profile worker {self.profile} did not start")
+        lines: queue.Queue[str | None] = queue.Queue()
+        ready_event = threading.Event()
+
+        def read_stdout() -> None:
+            assert proc.stdout is not None
+            try:
+                for line in proc.stdout:
+                    if ready_event.is_set():
+                        text = line.rstrip()
+                        if text:
+                            print(f"[hermes-bridge-worker:{self.profile}] {text}", file=sys.stderr, flush=True)
+                    else:
+                        lines.put(line)
+            finally:
+                lines.put(None)
+
+        threading.Thread(target=read_stdout, daemon=True, name=f"hermes-bridge-worker-stdout-{self.profile}").start()
+        deadline = time.time() + self.STARTUP_TIMEOUT_SECONDS
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                raise RuntimeError(f"profile worker {self.profile} exited before ready")
+            try:
+                line = lines.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if line is None:
+                time.sleep(0.05)
+                continue
+            text = line.strip()
+            if text:
+                print(f"[hermes-bridge-worker:{self.profile}] {text}", file=sys.stderr, flush=True)
+            try:
+                data = json.loads(text)
+                if data.get("event") == "ready":
+                    ready_event.set()
+                    return
+            except Exception:
+                pass
+        self.stop()
+        raise RuntimeError(f"profile worker {self.profile} did not become ready within {self.STARTUP_TIMEOUT_SECONDS}s")
+
+    def stop(self) -> None:
+        with self._lock:
+            proc = self.process
+            self.process = None
+        if proc is None:
+            return
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=3)
+        if self.endpoint.startswith("ipc://"):
+            try:
+                Path(self.endpoint.removeprefix("ipc://")).unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def request(self, req: dict[str, Any]) -> dict[str, Any]:
+        self.start()
+        self.last_used_at = time.time()
+        return _send_bridge_request(self.endpoint, req, self.REQUEST_TIMEOUT_SECONDS)
+
+
+def _worker_endpoint(profile: str) -> str:
+    safe = hashlib.sha256(profile.encode("utf-8")).hexdigest()[:16]
+    if os.name == "nt":
+        port_base = int(os.environ.get("HERMES_AGENT_BRIDGE_WORKER_PORT_BASE", "18780"))
+        return f"tcp://127.0.0.1:{port_base + int(safe[:4], 16) % 1000}"
+    root = Path(tempfile.gettempdir()) / "hermes-agent-bridge-workers"
+    return f"ipc://{root / f'{safe}.sock'}"
+
+
+def _connect_bridge_socket(endpoint: str, timeout: float) -> socket.socket:
+    if endpoint.startswith("ipc://"):
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        sock.connect(endpoint.removeprefix("ipc://"))
+        return sock
+    parsed = urlparse(endpoint)
+    if parsed.scheme != "tcp":
+        raise RuntimeError(f"unsupported endpoint scheme: {endpoint}")
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    sock.connect((parsed.hostname or "127.0.0.1", int(parsed.port or 0)))
+    return sock
+
+
+def _send_bridge_request(endpoint: str, req: dict[str, Any], timeout: float) -> dict[str, Any]:
+    sock = _connect_bridge_socket(endpoint, timeout)
+    try:
+        sock.sendall((json.dumps(req, ensure_ascii=False, default=str) + "\n").encode("utf-8"))
+        chunks: list[bytes] = []
+        while True:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            if b"\n" in chunk:
+                break
+        line = b"".join(chunks).split(b"\n", 1)[0].strip()
+        if not line:
+            raise RuntimeError("worker closed without a response")
+        resp = json.loads(line.decode("utf-8"))
+        if not resp.get("ok"):
+            raise RuntimeError(str(resp.get("error") or "worker request failed"))
+        return resp
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
+def _tcp_endpoint_port(endpoint: str) -> int | None:
+    parsed = urlparse(endpoint)
+    if parsed.scheme != "tcp":
+        return None
+    try:
+        port = int(parsed.port or 0)
+        return port if port > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _windows_listening_pids_on_port(port: int) -> list[int]:
+    if os.name != "nt":
+        return []
+    try:
+        result = subprocess.run(
+            ["netstat.exe", "-ano", "-p", "tcp"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return []
+    pids: set[int] = set()
+    for line in result.stdout.splitlines():
+        parts = line.strip().split()
+        if len(parts) < 5:
+            continue
+        proto, local_address, _remote_address, state, pid_raw = parts[:5]
+        if proto.upper() != "TCP" or state.upper() != "LISTENING":
+            continue
+        if not local_address.endswith(f":{port}"):
+            continue
+        try:
+            pid = int(pid_raw)
+        except ValueError:
+            continue
+        if pid > 0 and pid != os.getpid():
+            pids.add(pid)
+    return sorted(pids)
+
+
+def _kill_windows_endpoint_occupants(endpoint: str) -> None:
+    if os.name != "nt":
+        return
+    port = _tcp_endpoint_port(endpoint)
+    if not port:
+        return
+    for pid in _windows_listening_pids_on_port(port):
+        try:
+            print(
+                f"[hermes-bridge] killing stale process tree pid={pid} port={port}",
+                file=sys.stderr,
+                flush=True,
+            )
+            subprocess.run(
+                ["taskkill.exe", "/PID", str(pid), "/T", "/F"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except Exception as exc:
+            print(
+                f"[hermes-bridge] failed to kill stale process pid={pid}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+    deadline = time.time() + 3
+    while time.time() < deadline:
+        if not _windows_listening_pids_on_port(port):
+            return
+        time.sleep(0.1)
+
+
+def _make_listen_socket(endpoint: str) -> socket.socket:
+    _kill_windows_endpoint_occupants(endpoint)
+    if endpoint.startswith("ipc://"):
+        if not hasattr(socket, "AF_UNIX"):
+            raise RuntimeError("ipc:// endpoints require Unix domain socket support; use tcp://host:port on this platform")
+        sock_path = Path(endpoint.removeprefix("ipc://"))
+        sock_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            sock_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(str(sock_path))
+        return server
+
+    parsed = urlparse(endpoint)
+    if parsed.scheme != "tcp":
+        raise RuntimeError(f"unsupported endpoint scheme: {endpoint}")
+    host = parsed.hostname or "127.0.0.1"
+    port = int(parsed.port or 0)
+    if port <= 0:
+        raise RuntimeError(f"tcp endpoint requires a port: {endpoint}")
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind((host, port))
+    return server
+
+
+def _read_json_request(conn: socket.socket) -> dict[str, Any]:
+    chunks: list[bytes] = []
+    while True:
+        chunk = conn.recv(65536)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        if b"\n" in chunk:
+            break
+    if not chunks:
+        raise RuntimeError("empty request")
+    line = b"".join(chunks).split(b"\n", 1)[0].strip()
+    if not line:
+        raise RuntimeError("empty request")
+    return json.loads(line.decode("utf-8"))
+
+
+def _write_json_response(conn: socket.socket, resp: dict[str, Any]) -> None:
+    payload = json.dumps(resp, ensure_ascii=False, default=str) + "\n"
+    conn.sendall(payload.encode("utf-8"))
+
+
+class BridgeBroker:
+    IDLE_TIMEOUT_SECONDS = 30 * 60
+    GC_INTERVAL_SECONDS = 60
+
+    def __init__(self, endpoint: str, agent_root: str | None = None, hermes_home: str | None = None) -> None:
+        self.endpoint = endpoint
+        self.agent_root = agent_root
+        self.hermes_home = hermes_home
+        self._workers: dict[str, WorkerProcess] = {}
+        self._run_profile: dict[str, str] = {}
+        self._session_profile: dict[str, str] = {}
+        self._approval_profile: dict[str, str] = {}
+        self._compression_profile: dict[str, str] = {}
+        self._lock = threading.RLock()
+        self._stop = threading.Event()
+        self._last_gc = time.time()
+
+    def _normalize_profile(self, value: Any) -> str:
+        profile = str(value or "").strip()
+        return profile or "default"
+
+    def _worker_for_profile(self, profile: str) -> WorkerProcess:
+        profile = self._normalize_profile(profile)
+        with self._lock:
+            worker = self._workers.get(profile)
+            if worker is None:
+                worker = WorkerProcess(profile, _worker_endpoint(profile), self.agent_root, self.hermes_home)
+                self._workers[profile] = worker
+        return worker
+
+    def _profile_for_run(self, run_id: str) -> str:
+        with self._lock:
+            profile = self._run_profile.get(run_id)
+        if not profile:
+            raise KeyError(f"unknown run: {run_id}")
+        return profile
+
+    def _profile_for_session(self, session_id: str, fallback_profile: Any = None) -> str:
+        with self._lock:
+            profile = self._session_profile.get(session_id)
+        if not profile:
+            fallback = self._normalize_profile(fallback_profile)
+            if fallback_profile is not None and fallback:
+                return fallback
+            raise KeyError(f"unknown session: {session_id}")
+        return profile
+
+    def _record_response_routes(self, profile: str, resp: dict[str, Any]) -> None:
+        run_id = str(resp.get("run_id") or "")
+        session_id = str(resp.get("session_id") or "")
+        with self._lock:
+            if run_id:
+                self._run_profile[run_id] = profile
+            if session_id:
+                self._session_profile[session_id] = profile
+            for event in resp.get("events") or []:
+                if not isinstance(event, dict):
+                    continue
+                approval_id = str(event.get("approval_id") or "")
+                if approval_id:
+                    self._approval_profile[approval_id] = profile
+                request_id = str(event.get("request_id") or "")
+                if event.get("event") == "bridge.compression.requested" and request_id:
+                    self._compression_profile[request_id] = profile
+                if event.get("event") in {"bridge.compression.completed", "bridge.compression.failed"} and request_id:
+                    self._compression_profile.pop(request_id, None)
+
+    def _forward(self, profile: str, req: dict[str, Any]) -> dict[str, Any]:
+        worker = self._worker_for_profile(profile)
+        forwarded = dict(req)
+        forwarded["profile"] = profile
+        resp = worker.request(forwarded)
+        self._record_response_routes(profile, resp)
+        return resp
+
+    def handle(self, req: dict[str, Any]) -> dict[str, Any]:
+        action = str(req.get("action") or "").strip()
+        if not action:
+            raise ValueError("action is required")
+
+        if action == "ping":
+            with self._lock:
+                workers = {profile: worker.running for profile, worker in self._workers.items()}
+            return {"pong": True, "time": time.time(), "mode": "broker", "workers": workers}
+
+        if action == "worker_ping":
+            profile = self._normalize_profile(req.get("profile"))
+            resp = self._forward(profile, {"action": "ping"})
+            resp["worker_profile"] = profile
+            return resp
+
+        if action == "chat":
+            profile = self._normalize_profile(req.get("profile"))
+            return self._forward(profile, req)
+
+        if action in {"get_result", "get_output"}:
+            profile = self._profile_for_run(str(req.get("run_id") or ""))
+            return self._forward(profile, req)
+
+        if action in {"interrupt", "steer", "get_history", "destroy"}:
+            session_id = str(req.get("session_id") or "")
+            profile = self._profile_for_session(session_id, req.get("profile"))
+            resp = self._forward(profile, req)
+            if action == "destroy":
+                with self._lock:
+                    self._session_profile.pop(session_id, None)
+            return resp
+
+        if action == "approval_respond":
+            approval_id = str(req.get("approval_id") or "").strip()
+            if not approval_id:
+                raise ValueError("approval_id is required")
+            with self._lock:
+                profile = self._approval_profile.get(approval_id)
+            if not profile:
+                raise KeyError(f"unknown approval request: {approval_id}")
+            return self._forward(profile, req)
+
+        if action == "compression_respond":
+            request_id = str(req.get("request_id") or "").strip()
+            if not request_id:
+                raise ValueError("request_id is required")
+            with self._lock:
+                profile = self._compression_profile.get(request_id)
+            if not profile:
+                raise KeyError(f"unknown compression request: {request_id}")
+            return self._forward(profile, req)
+
+        if action == "destroy_all":
+            with self._lock:
+                workers = list(self._workers.values())
+                self._run_profile.clear()
+                self._session_profile.clear()
+                self._approval_profile.clear()
+                self._compression_profile.clear()
+            destroyed = 0
+            for worker in workers:
+                if not worker.running:
+                    worker.stop()
+                    continue
+                try:
+                    resp = worker.request({"action": "destroy_all"})
+                    destroyed += int(resp.get("destroyed") or 0)
+                except Exception:
+                    pass
+            return {"destroyed": destroyed}
+
+        if action == "destroy_profile":
+            profile = self._normalize_profile(req.get("profile"))
+            with self._lock:
+                worker = self._workers.get(profile)
+                self._run_profile = {key: value for key, value in self._run_profile.items() if value != profile}
+                self._session_profile = {key: value for key, value in self._session_profile.items() if value != profile}
+                self._approval_profile = {key: value for key, value in self._approval_profile.items() if value != profile}
+                self._compression_profile = {key: value for key, value in self._compression_profile.items() if value != profile}
+
+            if worker is None or not worker.running:
+                if worker is not None:
+                    worker.stop()
+                return {"profile": profile, "destroyed": 0}
+
+            try:
+                resp = worker.request({"action": "destroy_all"})
+                return {"profile": profile, "destroyed": int(resp.get("destroyed") or 0)}
+            except Exception:
+                return {"profile": profile, "destroyed": 0}
+
+        if action == "list":
+            sessions: list[Any] = []
+            with self._lock:
+                workers = list(self._workers.items())
+            for profile, worker in workers:
+                if not worker.running:
+                    continue
+                try:
+                    resp = worker.request({"action": "list"})
+                    for session in resp.get("sessions") or []:
+                        if isinstance(session, dict):
+                            session.setdefault("profile", profile)
+                        sessions.append(session)
+                except Exception:
+                    pass
+            return {"sessions": sessions}
+
+        if action == "shutdown":
+            self._stop.set()
+            with self._lock:
+                workers = list(self._workers.values())
+            for worker in workers:
+                if not worker.running:
+                    worker.stop()
+                    continue
+                try:
+                    worker.request({"action": "shutdown"})
+                except Exception:
+                    worker.stop()
+            return {"status": "shutting_down"}
+
+        raise ValueError(f"unknown action: {action}")
+
+    def _make_server_socket(self) -> socket.socket:
+        return _make_listen_socket(self.endpoint)
+
+    def _read_request(self, conn: socket.socket) -> dict[str, Any]:
+        return _read_json_request(conn)
+
+    def _write_response(self, conn: socket.socket, resp: dict[str, Any]) -> None:
+        _write_json_response(conn, resp)
+
+    def _gc_idle_workers(self) -> None:
+        now = time.time()
+        if now - self._last_gc < self.GC_INTERVAL_SECONDS:
+            return
+        self._last_gc = now
+        with self._lock:
+            idle = [
+                profile for profile, worker in self._workers.items()
+                if worker.running and now - worker.last_used_at > self.IDLE_TIMEOUT_SECONDS
+            ]
+        for profile in idle:
+            with self._lock:
+                worker = self._workers.pop(profile, None)
+            if worker:
+                worker.stop()
+
+    def serve_forever(self) -> None:
+        server = self._make_server_socket()
+        server.listen(64)
+        server.settimeout(0.2)
+        print(json.dumps({"event": "ready", "endpoint": self.endpoint, "mode": "broker"}), flush=True)
+
+        while not self._stop.is_set():
+            conn: socket.socket | None = None
+            try:
+                try:
+                    conn, _addr = server.accept()
+                except socket.timeout:
+                    self._gc_idle_workers()
+                    continue
+                try:
+                    req = self._read_request(conn)
+                    data = self.handle(req)
+                    resp = {"ok": True, **_jsonable(data)}
+                except Exception as exc:
+                    resp = {
+                        "ok": False,
+                        "error": str(exc),
+                        "error_type": exc.__class__.__name__,
+                    }
+                self._write_response(conn, resp)
+            except KeyboardInterrupt:
+                break
+            except Exception as exc:
+                print(f"[hermes-bridge-broker] server loop error: {exc}", file=sys.stderr, flush=True)
+            finally:
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except OSError:
+                        pass
+
+        with self._lock:
+            workers = list(self._workers.values())
+            self._workers.clear()
+        for worker in workers:
+            worker.stop()
+        server.close()
+        if self.endpoint.startswith("ipc://"):
+            try:
+                Path(self.endpoint.removeprefix("ipc://")).unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Hermes AIAgent in-process bridge")
     parser.add_argument("--endpoint", default=os.environ.get("HERMES_AGENT_BRIDGE_ENDPOINT", DEFAULT_ENDPOINT))
     parser.add_argument("--agent-root", default=os.environ.get("HERMES_AGENT_ROOT", DEFAULT_AGENT_ROOT))
     parser.add_argument("--hermes-home", default=os.environ.get("HERMES_HOME", DEFAULT_HERMES_HOME))
+    parser.add_argument("--worker-profile", default=os.environ.get("HERMES_AGENT_BRIDGE_WORKER_PROFILE"))
     args = parser.parse_args(argv)
 
     _set_path_env(args.agent_root, args.hermes_home)
     _ensure_agent_imports()
-    BridgeServer(args.endpoint).serve_forever()
+    if args.worker_profile:
+        _set_worker_profile_env(str(args.worker_profile or "default"))
+        BridgeServer(args.endpoint).serve_forever()
+    else:
+        BridgeBroker(args.endpoint, args.agent_root, args.hermes_home).serve_forever()
     return 0
 
 

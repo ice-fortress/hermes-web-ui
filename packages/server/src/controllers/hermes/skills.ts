@@ -2,10 +2,11 @@ import { readdir, readFile } from 'fs/promises'
 import { join, resolve } from 'path'
 import { createHash } from 'crypto'
 import {
-  readConfigYaml, writeConfigYaml,
+  readConfigYaml, updateConfigYaml,
   safeReadFile, extractDescription, listFilesRecursive, getHermesDir,
 } from '../../services/config-helpers'
 import { pinSkill } from '../../services/hermes/hermes-cli'
+import { isPathWithin } from '../../services/hermes/hermes-path'
 import { getSkillUsageStatsFromDb } from '../../db/hermes/sessions-db'
 
 /** Read bundled manifest as a name→hash map from ~/.hermes/skills/.bundled_manifest */
@@ -260,14 +261,15 @@ export async function toggle(ctx: any) {
     return
   }
   try {
-    const config = await readConfigYaml()
-    if (!config.skills) config.skills = {}
-    if (!Array.isArray(config.skills.disabled)) config.skills.disabled = []
-    const disabled = config.skills.disabled as string[]
-    const idx = disabled.indexOf(name)
-    if (enabled) { if (idx !== -1) disabled.splice(idx, 1) }
-    else { if (idx === -1) disabled.push(name) }
-    await writeConfigYaml(config)
+    await updateConfigYaml((config) => {
+      if (!config.skills) config.skills = {}
+      if (!Array.isArray(config.skills.disabled)) config.skills.disabled = []
+      const disabled = config.skills.disabled as string[]
+      const idx = disabled.indexOf(name)
+      if (enabled) { if (idx !== -1) disabled.splice(idx, 1) }
+      else { if (idx === -1) disabled.push(name) }
+      return config
+    })
     ctx.body = { success: true }
   } catch (err: any) {
     ctx.status = 500
@@ -300,7 +302,7 @@ export async function readFile_(ctx: any) {
     realPath = filePath.slice(5)
   }
   const fullPath = resolve(join(hd, 'skills', realPath))
-  if (!fullPath.startsWith(join(hd, 'skills'))) {
+  if (!isPathWithin(fullPath, join(hd, 'skills'))) {
     ctx.status = 403
     ctx.body = { error: 'Access denied' }
     return

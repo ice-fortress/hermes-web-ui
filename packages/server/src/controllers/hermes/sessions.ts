@@ -1,18 +1,19 @@
 import * as hermesCli from '../../services/hermes/hermes-cli'
-import { listSessionSummaries, getUsageStatsFromDb, getSessionDetailFromDb } from '../../db/hermes/sessions-db'
+import { listSessionSummaries, getUsageStatsFromDb, getSessionDetailFromDb, getExactSessionDetailFromDbWithProfile } from '../../db/hermes/sessions-db'
 import {
   listSessions as localListSessions,
   searchSessions as localSearchSessions,
+  getSession as localGetSession,
   getSessionDetail as localGetSessionDetail,
   deleteSession as localDeleteSession,
   renameSession as localRenameSession,
 } from '../../db/hermes/session-store'
 import { ExportCompressor } from '../../lib/context-compressor/export-compressor'
-import { getGatewayManagerInstance } from '../../services/gateway-bootstrap'
 import { deleteUsage, getUsage, getUsageBatch } from '../../db/hermes/usage-store'
 import type { UsageStatsModelRow, UsageStatsDailyRow } from '../../db/hermes/usage-store'
 import { getModelContextLength } from '../../services/hermes/model-context'
-import { getActiveProfileName } from '../../services/hermes/hermes-profile'
+import { getActiveProfileName, listProfileNamesFromDisk } from '../../services/hermes/hermes-profile'
+import { isPathWithin } from '../../services/hermes/hermes-path'
 import { getGroupChatServer } from '../../routes/hermes/group-chat'
 import { logger } from '../../services/logger'
 import type { ConversationSummary } from '../../services/hermes/conversations'
@@ -31,6 +32,43 @@ function filterPendingDeletedConversationSummaries(items: ConversationSummary[])
   return filterPendingDeletedSessions(items)
 }
 
+interface HermesDeleteResult {
+  attempted: boolean
+  deleted: boolean
+  profile?: string
+  error?: string
+}
+
+function hasProfileOnDisk(profile: string): boolean {
+  return listProfileNamesFromDisk().includes(profile || 'default')
+}
+
+async function deleteHermesSessionIfPresent(sessionId: string, profile?: string | null): Promise<HermesDeleteResult> {
+  const targetProfile = profile || 'default'
+  if (!hasProfileOnDisk(targetProfile)) {
+    return { attempted: false, deleted: false, profile: targetProfile }
+  }
+
+  try {
+    const hermesSession = await getExactSessionDetailFromDbWithProfile(sessionId, targetProfile)
+    if (!hermesSession) {
+      return { attempted: false, deleted: false, profile: targetProfile }
+    }
+
+    const deleted = await hermesCli.deleteSessionForProfile(sessionId, targetProfile)
+    return {
+      attempted: true,
+      deleted,
+      profile: targetProfile,
+      error: deleted ? undefined : 'Failed to delete Hermes session',
+    }
+  } catch (err: any) {
+    const message = err?.message || 'Failed to inspect Hermes session'
+    logger.warn({ err, sessionId, profile: targetProfile }, 'Hermes Session: profile delete skipped')
+    return { attempted: true, deleted: false, profile: targetProfile, error: message }
+  }
+}
+
 export async function listConversations(ctx: any) {
   const source = (ctx.query.source as string) || undefined
   const limit = ctx.query.limit ? parseInt(ctx.query.limit as string, 10) : undefined
@@ -41,6 +79,7 @@ export async function listConversations(ctx: any) {
     id: s.id,
     source: s.source,
     model: s.model,
+    provider: s.provider,
     title: s.title,
     started_at: s.started_at,
     ended_at: s.ended_at,
@@ -97,11 +136,19 @@ export async function getConversationMessages(ctx: any) {
 export async function list(ctx: any) {
   const source = (ctx.query.source as string) || undefined
   const limit = ctx.query.limit ? parseInt(ctx.query.limit as string, 10) : undefined
-  const profile = getActiveProfileName()
+  const profile = typeof ctx.query.profile === 'string' && ctx.query.profile.trim()
+    ? ctx.query.profile.trim()
+    : undefined
   const effectiveLimit = limit && limit > 0 ? limit : 2000
 
   const allSessions = localListSessions(profile, source, effectiveLimit)
-  ctx.body = { sessions: filterPendingDeletedSessions(allSessions.filter(s => s.source === 'api_server' || s.source === 'cli')) }
+  const knownProfiles = profile ? null : new Set(listProfileNamesFromDisk())
+  ctx.body = {
+    sessions: filterPendingDeletedSessions(allSessions.filter(s =>
+      (s.source === 'api_server' || s.source === 'cli') &&
+      (!knownProfiles || knownProfiles.has(s.profile || 'default')),
+    )),
+  }
 }
 
 /**
@@ -141,7 +188,16 @@ export async function get(ctx: any) {
  * GET /api/hermes/sessions/hermes/:id
  */
 export async function getHermesSession(ctx: any) {
-  // Try database first (consistent with listHermesSessions)
+  // Prefer the Web UI local session store. Hermes state.db can lag behind or
+  // miss messages for Bridge-backed runs, while the local store is the source
+  // used by chat rendering and compression.
+  const localSession = localGetSessionDetail(ctx.params.id)
+  if (localSession && localSession.source !== 'api_server') {
+    ctx.body = { session: localSession }
+    return
+  }
+
+  // Try Hermes state.db next (consistent with listHermesSessions)
   try {
     const session = await getSessionDetailFromDb(ctx.params.id)
     if (session && session.source !== 'api_server') {
@@ -170,14 +226,17 @@ export async function getHermesSession(ctx: any) {
 
 export async function remove(ctx: any) {
   const sessionId = ctx.params.id
-  const ok = localDeleteSession(sessionId)
-  if (!ok) {
+  const existing = localGetSession(sessionId)
+  const hermesProfile = existing?.profile || getActiveProfileName()
+  const hermes = await deleteHermesSessionIfPresent(sessionId, hermesProfile)
+  const localDeleted = existing ? localDeleteSession(sessionId) : true
+  if (!localDeleted) {
     ctx.status = 500
     ctx.body = { error: 'Failed to delete session' }
     return
   }
   deleteUsage(sessionId)
-  ctx.body = { ok: true }
+  ctx.body = { ok: true, deleted: Boolean(existing), hermes }
 }
 
 export async function batchRemove(ctx: any) {
@@ -198,10 +257,22 @@ export async function batchRemove(ctx: any) {
   const results = {
     deleted: 0,
     failed: 0,
-    errors: [] as Array<{ id: string; error: string }>
+    hermesDeleted: 0,
+    hermesFailed: 0,
+    errors: [] as Array<{ id: string; error: string }>,
+    hermesErrors: [] as Array<{ id: string; profile?: string; error: string }>
   }
 
   for (const id of validIds) {
+    const existing = localGetSession(id)
+    const hermes = await deleteHermesSessionIfPresent(id, existing?.profile)
+    if (hermes.deleted) {
+      results.hermesDeleted++
+    } else if (hermes.attempted && hermes.error) {
+      results.hermesFailed++
+      results.hermesErrors.push({ id, profile: hermes.profile, error: hermes.error })
+    }
+
     const ok = localDeleteSession(id)
     if (ok) {
       deleteUsage(id)
@@ -267,9 +338,33 @@ export async function setWorkspace(ctx: any) {
   ctx.body = { ok: true }
 }
 
+export async function setModel(ctx: any) {
+  const { model, provider } = ctx.request.body as { model?: string; provider?: string }
+  if (!model || typeof model !== 'string') {
+    ctx.status = 400
+    ctx.body = { error: 'model is required' }
+    return
+  }
+  if (provider !== undefined && provider !== null && typeof provider !== 'string') {
+    ctx.status = 400
+    ctx.body = { error: 'provider must be a string' }
+    return
+  }
+  const { updateSession, getSession, createSession } = await import('../../db/hermes/session-store')
+  const { getActiveProfileName } = await import('../../services/hermes/hermes-profile')
+  const id = ctx.params.id
+  if (!getSession(id)) {
+    createSession({ id, profile: getActiveProfileName(), title: '' })
+  }
+  updateSession(id, { model: model.trim(), provider: (provider || '').trim() } as any)
+  ctx.body = { ok: true }
+}
+
 export async function contextLength(ctx: any) {
   const profile = (ctx.query.profile as string) || undefined
-  ctx.body = { context_length: getModelContextLength(profile) }
+  const model = typeof ctx.query.model === 'string' ? ctx.query.model : undefined
+  const provider = typeof ctx.query.provider === 'string' ? ctx.query.provider : undefined
+  ctx.body = { context_length: getModelContextLength({ profile, model, provider }) }
 }
 
 export async function usageStats(ctx: any) {
@@ -342,7 +437,7 @@ export async function listWorkspaceFolders(ctx: any) {
 
   // Security: prevent path traversal
   const fullPath = resolve(join(WORKSPACE_BASE, subPath))
-  if (!fullPath.startsWith(resolve(WORKSPACE_BASE))) {
+  if (!isPathWithin(fullPath, WORKSPACE_BASE)) {
     ctx.status = 403
     ctx.body = { error: 'Access denied' }
     return
@@ -414,10 +509,9 @@ export async function exportSession(ctx: any) {
 }
 
 async function compressSession(session: any) {
-  const mgr = getGatewayManagerInstance()
-  const profile = getActiveProfileName()
-  const upstream = mgr ? mgr.getUpstream(profile).replace(/\/$/, '') : ''
-  const apiKey = mgr ? mgr.getApiKey(profile) || undefined : undefined
+  const profile = session.profile || getActiveProfileName()
+  const upstream = ''
+  const apiKey = undefined
   const messages = (session.messages || []).map((m: any) => ({
     role: m.role,
     content: m.content || '',
@@ -427,7 +521,11 @@ async function compressSession(session: any) {
     reasoning_content: m.reasoning,
   }))
 
-  return exportCompressor.compress(messages, upstream, apiKey, session.id, profile)
+  return exportCompressor.compress(messages, upstream, apiKey, session.id, {
+    profile,
+    model: session.model,
+    provider: session.provider,
+  })
 }
 
 function serializeAsText(title: string | null, messages: any[]): string {

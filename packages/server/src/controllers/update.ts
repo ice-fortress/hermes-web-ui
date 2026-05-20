@@ -65,6 +65,7 @@ function runNpm(args: string[], options: { timeout?: number } = {}) {
     timeout: options.timeout,
     stdio: ['pipe', 'pipe', 'pipe'],
     env: getCurrentNodeEnv(),
+    windowsHide: true,
   }).trim()
 }
 
@@ -81,6 +82,12 @@ function getGlobalCliScript() {
 }
 
 function runUpdateInstall() {
+  try {
+    runNpm(['cache', 'clean', '--force'], { timeout: 2 * 60 * 1000 })
+  } catch (err) {
+    console.warn('[update] failed to clean npm cache, continuing update:', err)
+  }
+
   return runNpm(['install', '-g', 'hermes-web-ui@latest'], { timeout: 10 * 60 * 1000 })
 }
 
@@ -131,7 +138,10 @@ export async function handleUpdate(ctx: any) {
       })
       restart.on('exit', (code, signal) => {
         updateInProgress = false
-        console.error(`[update] restart process exited before replacing server: code=${code} signal=${signal}`)
+        const failed = (typeof code === 'number' && code !== 0) || Boolean(signal)
+        if (failed) {
+          console.error(`[update] restart process exited before replacing server: code=${code} signal=${signal}`)
+        }
       })
       restart.unref()
     }, 3000)

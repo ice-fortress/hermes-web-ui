@@ -15,14 +15,14 @@ const emit = defineEmits<{
 
 const roomName = ref('')
 const inviteCode = ref('')
-const userName = ref('')
-const description = ref('')
+const userName = ref(localStorage.getItem('gc_user_name') || '')
+const description = ref(localStorage.getItem('gc_user_description') || '')
 const roomInput = ref<InputLikeInstance | null>(null)
 
 const compression = ref({
     triggerTokens: 100000,
     maxHistoryTokens: 32000,
-    tailMessageCount: 20,
+    tailMessageCount: 10,
 })
 
 function generateCode(): string {

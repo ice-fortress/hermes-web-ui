@@ -41,9 +41,9 @@
 
 ### AI 聊天
 
-- 通过 SSE 实时流式输出，支持异步 Run
+- 聊天前端通过 Socket.IO `/chat-run` 实时流式更新；聊天运行通过 Hermes agent bridge 执行
 - 多会话管理 — 创建、重命名、删除、切换会话
-- **自建会话数据库** — 本地 SQLite 存储，首次启动时自动从 Hermes state.db 同步 api_server 会话
+- **自建会话数据库** — Web UI 会话使用本地 SQLite；Hermes state.db 仅作为只读来源用于 Hermes 历史 API
 - 按来源分组会话（Telegram、Discord、Slack 等），可折叠手风琴面板
 - 活跃会话实时指示器 — 正在进行的会话置顶并显示旋转图标
 - 按最新消息时间排序会话列表
@@ -51,7 +51,7 @@
 - 工具调用详情展开（参数 / 结果）
 - 文件上传支持
 - 文件下载支持 — 支持下载用户上传的文件和 Agent 生成的文件，兼容 local、Docker、SSH、Singularity 等多种 terminal backend
-- 会话搜索 — Ctrl+K 全局搜索所有对话
+- 会话搜索 — Ctrl+K 搜索 Web UI 本地会话库；不包含只读 Hermes 历史会话
 - 全局模型选择器 — 自动从 `~/.hermes/auth.json` 凭证池发现可用模型
 - 每个会话显示模型标签和上下文 Token 用量
 
@@ -72,7 +72,6 @@
 
 - 凭证管理写入 `~/.hermes/.env`
 - 渠道行为设置写入 `~/.hermes/config.yaml`
-- 配置变更后自动重启网关
 - 每个平台已配置/未配置状态检测
 
 ### 用量分析
@@ -98,13 +97,11 @@
 - Provider URL 自动检测，支持非 v1 API 版本（如 `/v4`）
 - Provider 级别模型分组，支持切换默认模型
 
-### 多配置文件与网关
+### 多配置文件
 
 - 创建、重命名、删除、切换 Hermes 配置文件（Profile）
 - 克隆现有配置文件或从归档导入（`.tar.gz`）
 - 导出配置文件用于备份或分享
-- 多网关管理 — 按 Profile 启动、停止、监控网关
-- 自动端口冲突解决
 - 配置文件级别的配置和缓存隔离
 
 ### 文件浏览器
@@ -133,7 +130,7 @@
 
 ### 日志
 
-- 查看 Agent / Gateway / Error 日志
+- 查看 Agent / Server / Error 日志
 - 按日志级别、日志文件和关键词过滤
 - 结构化日志解析，HTTP 访问日志高亮
 
@@ -151,7 +148,7 @@
 - 会话重置（空闲超时、定时重置）
 - 隐私（PII 脱敏）
 - 模型设置（默认模型 & Provider）
-- API 服务器配置
+- Profile 和 Provider 配置
 
 ### Web 终端
 
@@ -188,7 +185,7 @@ bash <(curl -fsSL https://cdn.jsdelivr.net/gh/EKKOLearnAI/hermes-web-ui@main/scr
 hermes-web-ui start
 ```
 
-> WSL 会自动检测并使用 `hermes gateway run` 进行后台启动（无需 launchd/systemd）。
+> WSL 使用与其他本地安装相同的 Web UI 后台启动流程；Web UI 不再单独启动 gateway 服务。
 
 ### Docker Compose
 
@@ -213,6 +210,33 @@ docker compose logs -f hermes-webui
 
 更详细的说明与排错见：[`docs/docker.md`](./docs/docker.md)
 
+### Hermes Agent 运行时发现
+
+Web UI 启动后端聊天能力时，会优先使用包含 `run_agent.py` 的源码目录，例如
+`~/.hermes/hermes-agent`。如果找不到源码目录，会退回到已安装 `hermes` 命令所使用
+的 Python 环境，再退到系统 Python。因此源码安装和 `pip install hermes-agent` 这类
+包安装方式都可以兼容。
+
+## Web UI 环境变量
+
+这些变量只用于配置 Hermes Web UI 自身。Provider API Key 和 Hermes Agent 相关设置仍通过 Hermes profile 管理。
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `PORT` | `8648` | Web UI 监听端口。 |
+| `BIND_HOST` | `0.0.0.0` | Web UI 绑定地址。如需 IPv6，可显式设置为 `::`。 |
+| `HERMES_WEB_UI_HOME` | `~/.hermes-web-ui` | Web UI 数据目录，用于认证 token、登录凭据、日志、数据库和默认上传目录。兼容支持 `HERMES_WEBUI_STATE_DIR` 作为别名。 |
+| `UPLOAD_DIR` | `$HERMES_WEB_UI_HOME/upload` | 覆盖上传目录。 |
+| `CORS_ORIGINS` | `*` | Koa CORS origin 配置。 |
+| `AUTH_DISABLED` | 未设置 | 设置为 `1` 或 `true` 可关闭 Web UI 认证。 |
+| `AUTH_TOKEN` | 自动生成 | 显式指定 bearer token。未设置时，Web UI 会在 `HERMES_WEB_UI_HOME` 下自动生成。 |
+| `PROFILE` | `default` | 初始 Hermes profile 名称。 |
+| `LOG_LEVEL` | `info` | Server 日志级别。 |
+| `BRIDGE_LOG_LEVEL` | `$LOG_LEVEL` 或 `info` | Bridge 日志级别。 |
+| `MAX_DOWNLOAD_SIZE` | `200MB` | 最大文件下载大小。 |
+| `MAX_EDIT_SIZE` | `10MB` | 最大可编辑文件大小。 |
+| `WORKSPACE_BASE` | `/opt/data/workspace` | Workspace 浏览根目录。 |
+
 ### CLI 命令
 
 | 命令 | 说明 |
@@ -223,17 +247,18 @@ docker compose logs -f hermes-webui
 | `hermes-web-ui restart` | 重启后台进程 |
 | `hermes-web-ui status` | 查看运行状态 |
 | `hermes-web-ui update` | 更新到最新版本并重启 |
+| `hermes-web-ui upgrade` | `update` 的别名 |
 | `hermes-web-ui -v` | 显示版本号 |
 | `hermes-web-ui -h` | 显示帮助信息 |
+
+`update` / `upgrade` 会先尝试执行 `npm cache clean --force`，再执行 `npm install -g hermes-web-ui@latest` 并重启。缓存清理是 best-effort；如果清理失败，只提示 warning，升级安装会继续执行。
 
 ### 自动配置
 
 启动时 BFF 服务器会自动：
 
-- 校验 `~/.hermes/config.yaml` 并补全缺失的 `api_server` 字段
-- 修改时备份原配置到 `config.yaml.bak`
-- 检测并启动网关（如未运行）
-- 解决端口冲突（清理残留进程）
+- 初始化 Web UI 数据目录、本地数据库和内置技能
+- 启动 `/chat-run` 使用的 Hermes agent bridge
 - 启动成功后自动打开浏览器
 
 ---
@@ -248,19 +273,22 @@ npm run dev
 ```
 
 - 前端：http://localhost:5173
-- BFF 服务器：http://localhost:8648（代理到 Hermes 网关 8642）
+- BFF 服务器：http://localhost:8648
 
 ```bash
 npm run build   # 构建输出到 dist/
 ```
 
+项目开发规范见：[DEVELOPMENT.md](./DEVELOPMENT.md)。
+
 ## 架构
 
 ```
-浏览器 → BFF (Koa, :8648) → Hermes 网关 (:8642)
+浏览器 → BFF (Koa, :8648) → Socket.IO /chat-run
                 ↓
-           Hermes CLI (会话、日志、版本)
+        Hermes agent bridge → Hermes Agent runtime
                 ↓
+           Hermes CLI / profiles
            ~/.hermes/config.yaml  (渠道行为配置)
            ~/.hermes/auth.json    (凭证池)
            腾讯 iLink API         (微信扫码登录)
@@ -268,7 +296,7 @@ npm run build   # 构建输出到 dist/
 
 前端采用 **多 Agent 可扩展架构** — 所有 Hermes 相关代码都按命名空间组织在 `hermes/` 目录下（API、组件、视图、Store），可以方便地并行接入新的 Agent。
 
-BFF 层负责：API 代理（含路径重写）、SSE 流式推送、文件上传与下载（多 Backend 支持：local/Docker/SSH/Singularity）、通过 CLI 管理会话 CRUD、配置/凭证管理、微信扫码登录、模型发现、技能/记忆管理、日志读取和静态文件服务。
+BFF 层负责：Socket.IO 聊天流式推送、Hermes agent bridge、文件上传与下载（多 Backend 支持：local/Docker/SSH/Singularity）、会话 CRUD、配置/凭证管理、微信扫码登录、模型发现、技能/记忆管理、日志读取和静态文件服务。
 
 ## 技术栈
 

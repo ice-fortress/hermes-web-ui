@@ -1,7 +1,7 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import * as configApi from '@/api/hermes/config'
-import type { DisplayConfig, AgentConfig, MemoryConfig, SessionResetConfig, PrivacyConfig, ApprovalConfig } from '@/api/hermes/config'
+import type { DisplayConfig, AgentConfig, MemoryConfig, CompressionConfig, SessionResetConfig, PrivacyConfig, ApprovalConfig } from '@/api/hermes/config'
 
 export const useSettingsStore = defineStore('settings', () => {
   const loading = ref(false)
@@ -10,6 +10,7 @@ export const useSettingsStore = defineStore('settings', () => {
   const display = ref<DisplayConfig>({})
   const agent = ref<AgentConfig>({})
   const memory = ref<MemoryConfig>({})
+  const compression = ref<CompressionConfig>({})
   const sessionReset = ref<SessionResetConfig>({})
   const privacy = ref<PrivacyConfig>({})
   const approvals = ref<ApprovalConfig>({})
@@ -21,6 +22,7 @@ export const useSettingsStore = defineStore('settings', () => {
   const wecom = ref<Record<string, any>>({})
   const feishu = ref<Record<string, any>>({})
   const dingtalk = ref<Record<string, any>>({})
+  const qqbot = ref<Record<string, any>>({})
   const weixin = ref<Record<string, any>>({})
   const platforms = ref<Record<string, any>>({})
 
@@ -31,6 +33,7 @@ export const useSettingsStore = defineStore('settings', () => {
       display.value = data.display || {}
       agent.value = data.agent || {}
       memory.value = data.memory || {}
+      compression.value = data.compression || {}
       sessionReset.value = data.session_reset || {}
       privacy.value = data.privacy || {}
       approvals.value = data.approvals || {}
@@ -42,6 +45,7 @@ export const useSettingsStore = defineStore('settings', () => {
       wecom.value = data.wecom || {}
       feishu.value = data.feishu || {}
       dingtalk.value = data.dingtalk || {}
+      qqbot.value = data.qqbot || {}
       weixin.value = data.weixin || {}
       platforms.value = data.platforms || {}
     } catch (err) {
@@ -56,6 +60,7 @@ export const useSettingsStore = defineStore('settings', () => {
       case 'display': display.value = { ...display.value, ...values }; break
       case 'agent': agent.value = { ...agent.value, ...values }; break
       case 'memory': memory.value = { ...memory.value, ...values }; break
+      case 'compression': compression.value = { ...compression.value, ...values }; break
       case 'session_reset': sessionReset.value = { ...sessionReset.value, ...values }; break
       case 'privacy': privacy.value = { ...privacy.value, ...values }; break
       case 'approvals': approvals.value = { ...approvals.value, ...values }; break
@@ -67,6 +72,7 @@ export const useSettingsStore = defineStore('settings', () => {
       case 'wecom': wecom.value = { ...wecom.value, ...values }; break
       case 'feishu': feishu.value = { ...feishu.value, ...values }; break
       case 'dingtalk': dingtalk.value = { ...dingtalk.value, ...values }; break
+      case 'qqbot': qqbot.value = { ...qqbot.value, ...values }; break
       case 'weixin': weixin.value = { ...weixin.value, ...values }; break
       case 'platforms': {
         for (const [key, val] of Object.entries(values)) {
@@ -80,14 +86,15 @@ export const useSettingsStore = defineStore('settings', () => {
     }
   }
 
-  async function saveSection(section: string, values: Record<string, any>) {
+  async function saveSection(section: string, values: Record<string, any>, options?: { restart?: boolean }) {
     saving.value = true
     try {
-      await configApi.updateConfigSection(section, values)
+      await configApi.updateConfigSection(section, values, options)
     switch (section) {
       case 'display': display.value = { ...display.value, ...values }; break
       case 'agent': agent.value = { ...agent.value, ...values }; break
       case 'memory': memory.value = { ...memory.value, ...values }; break
+      case 'compression': compression.value = { ...compression.value, ...values }; break
       case 'session_reset': sessionReset.value = { ...sessionReset.value, ...values }; break
       case 'privacy': privacy.value = { ...privacy.value, ...values }; break
       case 'approvals': approvals.value = { ...approvals.value, ...values }; break
@@ -99,6 +106,7 @@ export const useSettingsStore = defineStore('settings', () => {
       case 'wechat': case 'wecom': wecom.value = { ...wecom.value, ...values }; break
       case 'feishu': feishu.value = { ...feishu.value, ...values }; break
       case 'dingtalk': dingtalk.value = { ...dingtalk.value, ...values }; break
+      case 'qqbot': qqbot.value = { ...qqbot.value, ...values }; break
       case 'weixin': weixin.value = { ...weixin.value, ...values }; break
       case 'platforms': {
         // Deep-merge each platform's credentials
@@ -118,8 +126,8 @@ export const useSettingsStore = defineStore('settings', () => {
 
   return {
     loading, saving,
-    display, agent, memory, sessionReset, privacy, approvals,
-    telegram, discord, slack, whatsapp, matrix, wecom, feishu, dingtalk, weixin, platforms,
+    display, agent, memory, compression, sessionReset, privacy, approvals,
+    telegram, discord, slack, whatsapp, matrix, wecom, feishu, dingtalk, qqbot, weixin, platforms,
     fetchSettings, saveSection, updateLocal,
   }
 })

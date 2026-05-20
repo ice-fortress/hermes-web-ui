@@ -1,27 +1,99 @@
-import { createReadStream, existsSync, unlinkSync, writeFileSync } from 'fs'
+import { createReadStream, existsSync, readdirSync, rmSync, unlinkSync, writeFileSync } from 'fs'
 import { mkdir, writeFile } from 'fs/promises'
 import { basename, join } from 'path'
 import { tmpdir } from 'os'
 import * as hermesCli from '../../services/hermes/hermes-cli'
 import { SessionDeleter } from '../../services/hermes/session-deleter'
-import { getGatewayManagerInstance } from '../../services/gateway-bootstrap'
+import { AgentBridgeClient } from '../../services/hermes/agent-bridge'
 import { logger } from '../../services/logger'
 import { smartCloneCleanup } from '../../services/hermes/profile-credentials'
-import { detectHermesHome } from '../../services/hermes/hermes-path'
+import { detectHermesRootHome } from '../../services/hermes/hermes-path'
+import { getActiveProfileName } from '../../services/hermes/hermes-profile'
+import type { HermesProfile } from '../../services/hermes/hermes-cli'
+
+const bridgeCleanupClient = () => new AgentBridgeClient({ connectRetryMs: 0, timeoutMs: 5000 })
+
+const RESERVED_PROFILE_NAMES = new Set([
+  'hermes', 'default', 'test', 'tmp', 'root', 'sudo',
+])
+
+const HERMES_SUBCOMMAND_PROFILE_NAMES = new Set([
+  'chat', 'model', 'gateway', 'setup', 'whatsapp', 'login', 'logout',
+  'status', 'cron', 'doctor', 'dump', 'config', 'pairing', 'skills', 'tools',
+  'mcp', 'sessions', 'insights', 'version', 'update', 'uninstall',
+  'profile', 'plugins', 'honcho', 'acp',
+])
+
+function normalizeProfileName(name: string): string {
+  return String(name || '').trim().toLowerCase()
+}
+
+function isForbiddenProfileName(name: string): boolean {
+  const normalized = normalizeProfileName(name)
+  if (!normalized || normalized === 'default') return false
+  return RESERVED_PROFILE_NAMES.has(normalized) || HERMES_SUBCOMMAND_PROFILE_NAMES.has(normalized)
+}
+
+function getActiveProfileFile(): string {
+  return join(detectHermesRootHome(), 'active_profile')
+}
+
+function listProfilesFromDisk(activeProfileName: string): HermesProfile[] {
+  const base = detectHermesRootHome()
+  const profiles: HermesProfile[] = [{
+    name: 'default',
+    active: activeProfileName === 'default',
+    model: '—',
+    alias: '',
+  }]
+  const profilesDir = join(base, 'profiles')
+  if (!existsSync(profilesDir)) return profiles
+  for (const entry of readdirSync(profilesDir, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue
+    const name = entry.name
+    const dir = join(profilesDir, name)
+    if (!existsSync(join(dir, 'config.yaml')) && !existsSync(dir)) continue
+    profiles.push({
+      name,
+      active: name === activeProfileName,
+      model: '—',
+      alias: '',
+    })
+  }
+  return profiles
+}
 
 function profileExistsForManualSwitch(name: string): boolean {
-  const base = detectHermesHome()
+  const base = detectHermesRootHome()
   if (!name || name === 'default') return true
   return existsSync(join(base, 'profiles', name, 'config.yaml')) || existsSync(join(base, 'profiles', name))
 }
 
+function deleteForbiddenProfileFromDisk(name: string): boolean {
+  if (!isForbiddenProfileName(name)) return false
+  const base = detectHermesRootHome()
+  const profileDir = join(base, 'profiles', name)
+  if (!existsSync(profileDir)) return false
+  rmSync(profileDir, { recursive: true, force: true })
+  try {
+    if (normalizeProfileName(getActiveProfileName()) === normalizeProfileName(name)) {
+      writeFileSync(getActiveProfileFile(), 'default\n', 'utf-8')
+    }
+  } catch {}
+  logger.warn('[deleteProfile] removed reserved profile "%s" from disk after Hermes CLI rejected deletion', name)
+  return true
+}
+
 async function useProfileWithFallback(name: string): Promise<string> {
+  if (isForbiddenProfileName(name)) {
+    throw new Error(`Profile name '${name}' is reserved and cannot be activated`)
+  }
   try {
     return await hermesCli.useProfile(name)
   } catch (err: any) {
     if (!profileExistsForManualSwitch(name)) throw err
 
-    const base = detectHermesHome()
+    const base = detectHermesRootHome()
     writeFileSync(join(base, 'active_profile'), `${name}\n`, 'utf-8')
     logger.warn(err, '[switchProfile] hermes profile use failed; wrote active_profile directly for existing profile "%s"', name)
     return `Switched to profile ${name}`
@@ -30,7 +102,18 @@ async function useProfileWithFallback(name: string): Promise<string> {
 
 export async function list(ctx: any) {
   try {
-    const profiles = await hermesCli.listProfiles()
+    let profiles: HermesProfile[]
+    try {
+      profiles = await hermesCli.listProfiles()
+    } catch (err: any) {
+      const { getActiveProfileName } = await import('../../services/hermes/hermes-profile')
+      const activeProfileName = getActiveProfileName()
+      if (!isForbiddenProfileName(activeProfileName)) throw err
+
+      logger.warn(err, '[listProfiles] active_profile "%s" is invalid/reserved; resetting to default and listing profiles from disk', activeProfileName)
+      writeFileSync(getActiveProfileFile(), 'default\n', 'utf-8')
+      profiles = listProfilesFromDisk('default')
+    }
 
     // Override active flag from the authoritative source (active_profile file)
     // CLI output may be stale, but the file is written by hermes profile use
@@ -61,6 +144,11 @@ export async function create(ctx: any) {
   if (!name) {
     ctx.status = 400
     ctx.body = { error: 'Missing profile name' }
+    return
+  }
+  if (isForbiddenProfileName(name)) {
+    ctx.status = 400
+    ctx.body = { error: `Profile name '${name}' is reserved and cannot be created` }
     return
   }
   try {
@@ -98,12 +186,6 @@ export async function create(ctx: any) {
       }
     }
 
-    const mgr = getGatewayManagerInstance()
-    if (mgr) {
-      try { await mgr.start(name) } catch (err: any) {
-        logger.error(err, 'Failed to start gateway for profile "%s"', name)
-      }
-    }
     ctx.body = {
       success: true,
       message: output.trim(),
@@ -135,11 +217,17 @@ export async function remove(ctx: any) {
     return
   }
   try {
-    const mgr = getGatewayManagerInstance()
-    if (mgr) { try { await mgr.stop(name) } catch { } }
+    try {
+      const result = await bridgeCleanupClient().destroyProfile(name)
+      logger.info('[profiles] destroyed bridge sessions for deleted profile "%s" destroyed=%s', name, result.destroyed)
+    } catch (err) {
+      logger.warn(err, '[profiles] failed to destroy bridge sessions for deleted profile "%s"', name)
+    }
     const ok = await hermesCli.deleteProfile(name)
     if (ok) {
       ctx.body = { success: true }
+    } else if (deleteForbiddenProfileFromDisk(name)) {
+      ctx.body = { success: true, fallback: 'removed_reserved_profile_from_disk' }
     } else {
       ctx.status = 500
       ctx.body = { error: 'Failed to delete profile' }
@@ -178,6 +266,11 @@ export async function switchProfile(ctx: any) {
     ctx.body = { error: 'Missing profile name' }
     return
   }
+  if (isForbiddenProfileName(name)) {
+    ctx.status = 400
+    ctx.body = { error: `Profile name '${name}' is reserved and cannot be activated` }
+    return
+  }
   try {
     const output = await useProfileWithFallback(name)
 
@@ -201,15 +294,9 @@ export async function switchProfile(ctx: any) {
       return
     }
 
-    // Update GatewayManager to match the authoritative source
-    const mgr = getGatewayManagerInstance()
-    if (mgr) { mgr.setActiveProfile(name) }
-
     // Destroy all bridge sessions so they get recreated with the new profile config
     try {
-      const { AgentBridgeClient } = await import('../../services/hermes/agent-bridge')
-      const bridge = new AgentBridgeClient()
-      await bridge.destroyAll()
+      await bridgeCleanupClient().destroyAll()
       logger.info('[switchProfile] destroyed all bridge sessions for profile "%s"', name)
     } catch (err: any) {
       logger.warn(err, '[switchProfile] failed to destroy bridge sessions')
