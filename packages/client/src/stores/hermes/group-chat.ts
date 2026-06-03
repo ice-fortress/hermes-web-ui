@@ -1,6 +1,7 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import { getApiKey } from '@/api/client'
+import { fetchCurrentUser } from '@/api/auth'
 import { getDownloadUrl } from '@/api/hermes/download'
 import type { Attachment, ContentBlock } from './chat'
 import {
@@ -125,6 +126,24 @@ export const useGroupChatStore = defineStore('groupChat', () => {
     const contextStatuses = ref<Map<string, { agentName: string; status: string }>>(new Map())
     const autoPlaySpeechEnabled = ref(false)
     const pendingApprovals = ref<Map<string, GroupPendingApproval>>(new Map())
+    const totalMessages = ref(0)
+    const loadedMessageCount = ref(0)
+    const hasMoreBefore = ref(false)
+    const isLoadingOlderMessages = ref(false)
+const currentUserAvatar = ref('')
+
+    function resetMessagePaging() {
+        totalMessages.value = 0
+        loadedMessageCount.value = 0
+        hasMoreBefore.value = false
+        isLoadingOlderMessages.value = false
+    }
+
+    function applyMessagePaging(res: { messages: ChatMessage[]; total?: number; hasMore?: boolean }) {
+        loadedMessageCount.value = res.messages.length
+        totalMessages.value = res.total ?? res.messages.length
+        hasMoreBefore.value = res.hasMore ?? loadedMessageCount.value < totalMessages.value
+    }
 
     function setAutoPlaySpeech(enabled: boolean) {
         autoPlaySpeechEnabled.value = enabled
@@ -198,10 +217,17 @@ export const useGroupChatStore = defineStore('groupChat', () => {
     })
 
     // ─── Connection ────────────────────────────────────────
-    function connect() {
+    async function connect() {
+        let authUserId: number | undefined
+        try {
+            const user = await fetchCurrentUser()
+            authUserId = user.id
+            currentUserAvatar.value = user.avatar || ''
+        } catch { /* non-critical: avatar fallback handles missing id */ }
         const socket = connectGroupChat({
             userId: userId.value,
             userName: userName.value || undefined,
+            authUserId,
         })
         console.log('[GroupChat] connecting...', { userId: userId.value, userName: userName.value })
 
@@ -232,6 +258,8 @@ export const useGroupChatStore = defineStore('groupChat', () => {
                     messages.value = [...messages.value]
                 } else {
                     messages.value.push(resolvedMsg)
+                    loadedMessageCount.value += 1
+                    totalMessages.value = Math.max(totalMessages.value + 1, loadedMessageCount.value)
                 }
                 if (autoPlaySpeechEnabled.value && resolvedMsg.role === 'assistant' && resolvedMsg.content?.trim()) {
                     setTimeout(() => playMessageSpeech(resolvedMsg.id, resolvedMsg.content), 300)
@@ -266,6 +294,8 @@ export const useGroupChatStore = defineStore('groupChat', () => {
                 messages.value = [...messages.value]
             } else {
                 messages.value.push(msg)
+                loadedMessageCount.value += 1
+                totalMessages.value = Math.max(totalMessages.value + 1, loadedMessageCount.value)
             }
         })
 
@@ -400,6 +430,7 @@ export const useGroupChatStore = defineStore('groupChat', () => {
             if (room) room.totalTokens = data.totalTokens
             if (data.roomId === currentRoomId.value) {
                 messages.value = []
+                resetMessagePaging()
                 typingUsers.value.clear()
                 contextStatuses.value.clear()
                 pendingApprovals.value.clear()
@@ -412,6 +443,7 @@ export const useGroupChatStore = defineStore('groupChat', () => {
         connected.value = false
         currentRoomId.value = null
         messages.value = []
+        resetMessagePaging()
         members.value = []
         agents.value = []
         roomName.value = ''
@@ -436,6 +468,7 @@ export const useGroupChatStore = defineStore('groupChat', () => {
             currentRoomId.value = res.room.id
             roomName.value = res.room.name
             messages.value = res.messages
+            applyMessagePaging(res)
             agents.value = res.agents
             members.value = res.members || []
         } catch (err: any) {
@@ -481,6 +514,28 @@ export const useGroupChatStore = defineStore('groupChat', () => {
         }
     }
 
+    async function loadOlderMessages(): Promise<boolean> {
+        const roomId = currentRoomId.value
+        if (!roomId || isLoadingOlderMessages.value || !hasMoreBefore.value) return false
+        const offset = loadedMessageCount.value
+        isLoadingOlderMessages.value = true
+        try {
+            const res = await getRoomDetail(roomId, { offset, limit: 300 })
+            const existingIds = new Set(messages.value.map(message => message.id))
+            const olderMessages = res.messages.filter(message => !existingIds.has(message.id))
+            messages.value = [...olderMessages, ...messages.value]
+            loadedMessageCount.value = offset + res.messages.length
+            totalMessages.value = res.total ?? totalMessages.value
+            hasMoreBefore.value = res.hasMore ?? loadedMessageCount.value < totalMessages.value
+            return olderMessages.length > 0
+        } catch (err: any) {
+            error.value = err.message
+            return false
+        } finally {
+            isLoadingOlderMessages.value = false
+        }
+    }
+
     async function sendMessage(content: string, attachments?: Attachment[]) {
         const socket = getSocket()
         if (!socket || !currentRoomId.value) return
@@ -503,6 +558,8 @@ export const useGroupChatStore = defineStore('groupChat', () => {
                 role: 'user',
                 attachments: attachments.map(att => ({ ...att, url: urlMap.get(att.name) || att.url, file: undefined })),
             })
+            loadedMessageCount.value += 1
+            totalMessages.value = Math.max(totalMessages.value + 1, loadedMessageCount.value)
         }
 
         return new Promise<void>((resolve, reject) => {
@@ -560,6 +617,7 @@ export const useGroupChatStore = defineStore('groupChat', () => {
             if (currentRoomId.value === roomId) {
                 currentRoomId.value = null
                 messages.value = []
+                resetMessagePaging()
                 members.value = []
                 agents.value = []
                 roomName.value = ''
@@ -586,6 +644,7 @@ export const useGroupChatStore = defineStore('groupChat', () => {
         try {
             const res = await clearRoomContext(currentRoomId.value)
             messages.value = []
+            resetMessagePaging()
             typingUsers.value.clear()
             contextStatuses.value.clear()
             const idx = rooms.value.findIndex(r => r.id === currentRoomId.value)
@@ -618,8 +677,9 @@ export const useGroupChatStore = defineStore('groupChat', () => {
 
     async function removeAgentFromRoom(roomId: string, agentId: string) {
         try {
-            await removeAgent(roomId, agentId)
-            agents.value = agents.value.filter(a => a.id !== agentId)
+            const res = await removeAgent(roomId, agentId)
+            agents.value = res.agents ?? agents.value.filter(a => a.id !== agentId && a.agentId !== agentId)
+            if (res.members) members.value = res.members
         } catch (err: any) {
             error.value = err.message
             throw err
@@ -689,8 +749,13 @@ export const useGroupChatStore = defineStore('groupChat', () => {
         pendingApprovals,
         activePendingApproval,
         autoPlaySpeechEnabled,
+        totalMessages,
+        loadedMessageCount,
+        hasMoreBefore,
+        isLoadingOlderMessages,
         userId,
         userName,
+        currentUserAvatar,
         // Computed
         sortedMessages,
         memberNames,
@@ -702,6 +767,7 @@ export const useGroupChatStore = defineStore('groupChat', () => {
         setUserInfo,
         setAutoPlaySpeech,
         joinRoom,
+        loadOlderMessages,
         sendMessage,
         loadRooms,
         emitTyping,

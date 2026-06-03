@@ -1,13 +1,66 @@
-import { readdir, readFile } from 'fs/promises'
+import { mkdir, readdir, readFile, stat, writeFile } from 'fs/promises'
+import { homedir } from 'os'
 import { join, resolve } from 'path'
 import { createHash } from 'crypto'
 import {
-  readConfigYaml, updateConfigYaml,
-  safeReadFile, extractDescription, listFilesRecursive, getHermesDir,
+  readConfigYamlForProfile, updateConfigYamlForProfile,
+  safeReadFile, extractDescription, listFilesRecursive,
 } from '../../services/config-helpers'
-import { pinSkill } from '../../services/hermes/hermes-cli'
+import type { SkillSource } from '../../services/config-helpers'
 import { isPathWithin } from '../../services/hermes/hermes-path'
+import { getActiveProfileName, getProfileDir } from '../../services/hermes/hermes-profile'
 import { getSkillUsageStatsFromDb } from '../../db/hermes/sessions-db'
+
+function requestedProfile(ctx: any): string {
+  return ctx.state?.profile?.name || getActiveProfileName() || 'default'
+}
+
+function requestProfileDir(ctx: any): string {
+  return getProfileDir(requestedProfile(ctx))
+}
+
+function requestSkillsDir(ctx: any): string {
+  return join(requestProfileDir(ctx), 'skills')
+}
+
+function expandConfiguredPath(value: string): string {
+  const expandedEnv = value.replace(/\$\{([^}]+)\}|\$([A-Za-z_][A-Za-z0-9_]*)/g, (_match, braced, bare) => {
+    return process.env[braced || bare] || ''
+  })
+  if (expandedEnv === '~') return homedir()
+  if (expandedEnv.startsWith('~/')) return join(homedir(), expandedEnv.slice(2))
+  return expandedEnv
+}
+
+async function resolveExternalSkillsDirs(config: Record<string, any>, localSkillsDir: string): Promise<string[]> {
+  const rawDirs = config.skills?.external_dirs
+  const entries = typeof rawDirs === 'string'
+    ? [rawDirs]
+    : Array.isArray(rawDirs)
+      ? rawDirs
+      : []
+  const localResolved = resolve(localSkillsDir)
+  const seen = new Set<string>()
+  const dirs: string[] = []
+
+  for (const rawEntry of entries) {
+    const entry = String(rawEntry || '').trim()
+    if (!entry) continue
+    const expanded = expandConfiguredPath(entry)
+    const resolved = resolve(expanded)
+    if (resolved === localResolved || seen.has(resolved)) continue
+    try {
+      const info = await stat(resolved)
+      if (!info.isDirectory()) continue
+    } catch {
+      continue
+    }
+    seen.add(resolved)
+    dirs.push(resolved)
+  }
+
+  return dirs
+}
 
 /** Read bundled manifest as a name→hash map from ~/.hermes/skills/.bundled_manifest */
 function readBundledManifest(manifestContent: string | null): Map<string, string> {
@@ -63,7 +116,7 @@ function getSkillSource(
   dirName: string,
   bundledManifest: Map<string, string>,
   hubNames: Set<string>,
-): 'builtin' | 'hub' | 'local' {
+): SkillSource {
   if (bundledManifest.has(dirName)) return 'builtin'
   if (hubNames.has(dirName)) return 'hub'
   return 'local'
@@ -82,6 +135,57 @@ function readUsageStats(usageContent: string | null): Map<string, UsageStats> {
     }
   } catch { /* ignore */ }
   return map
+}
+
+async function findSkillDirByName(rootDir: string, skillName: string): Promise<string | null> {
+  let entries: import('fs').Dirent[]
+  try {
+    entries = await readdir(rootDir, { withFileTypes: true })
+  } catch {
+    return null
+  }
+
+  for (const entry of entries) {
+    if (!entry.isDirectory() || entry.name.startsWith('.')) continue
+
+    const entryPath = join(rootDir, entry.name)
+    const skillMd = await safeReadFile(join(entryPath, 'SKILL.md'))
+    if (skillMd !== null) {
+      if (entry.name === skillName) return entryPath
+      // This is another skill root. Do not search inside its references/scripts.
+      continue
+    }
+
+    const found = await findSkillDirByName(entryPath, skillName)
+    if (found) return found
+  }
+
+  return null
+}
+
+async function findSkillDirInRoot(rootDir: string, category: string, skillName: string): Promise<string | null> {
+  if (category === 'misc') {
+    const skillDir = join(rootDir, skillName)
+    const skillMd = await safeReadFile(join(skillDir, 'SKILL.md'))
+    return skillMd !== null ? skillDir : null
+  }
+  return findSkillDirByName(join(rootDir, category), skillName)
+}
+
+async function resolveSkillDirFromConfig(
+  config: Record<string, any>,
+  localSkillsDir: string,
+  category: string,
+  skillName: string,
+): Promise<string | null> {
+  const localSkillDir = await findSkillDirInRoot(localSkillsDir, category, skillName)
+  if (localSkillDir) return localSkillDir
+
+  for (const externalDir of await resolveExternalSkillsDirs(config, localSkillsDir)) {
+    const externalSkillDir = await findSkillDirInRoot(externalDir, category, skillName)
+    if (externalSkillDir) return externalSkillDir
+  }
+  return null
 }
 
 /**
@@ -136,33 +240,45 @@ async function scanSkillsDir(skillsDir: string, bundledManifest: Map<string, str
     const catDir = join(skillsDir, cat.name)
     const subEntries = await readdir(catDir, { withFileTypes: true })
     const skills: any[] = []
-    for (const se of subEntries) {
-      if (!se.isDirectory()) continue
-      const skillMd = await safeReadFile(join(catDir, se.name, 'SKILL.md'))
-      if (skillMd) {
-        const source = getSkillSource(se.name, bundledManifest, hubNames)
-        let modified = false
-        if (source === 'builtin') {
-          const manifestHash = bundledManifest.get(se.name)
-          if (manifestHash) {
-            const currentHash = await dirHash(join(catDir, se.name))
-            modified = currentHash !== manifestHash
+    // Recursively collect skills from subdirectories (supports nested sub-categories)
+    async function collectSkills(dir: string): Promise<any[]> {
+      const entries = await readdir(dir, { withFileTypes: true })
+      const results: any[] = []
+      for (const entry of entries) {
+        if (!entry.isDirectory() || entry.name.startsWith('.')) continue
+        const entryPath = join(dir, entry.name)
+        const skillMd = await safeReadFile(join(entryPath, 'SKILL.md'))
+        if (skillMd) {
+          const source = getSkillSource(entry.name, bundledManifest, hubNames)
+          let modified = false
+          if (source === 'builtin') {
+            const manifestHash = bundledManifest.get(entry.name)
+            if (manifestHash) {
+              const currentHash = await dirHash(entryPath)
+              modified = currentHash !== manifestHash
+            }
           }
+          const usage = usageStats.get(entry.name)
+          results.push({
+            name: entry.name,
+            description: extractDescription(skillMd),
+            enabled: !disabledList.includes(entry.name),
+            source,
+            modified: modified || undefined,
+            patchCount: usage?.patch_count,
+            useCount: usage?.use_count,
+            viewCount: usage?.view_count,
+            pinned: usage?.pinned || undefined,
+          })
+        } else {
+          // No SKILL.md — might be a sub-category container, recurse deeper
+          const subResults = await collectSkills(entryPath)
+          results.push(...subResults)
         }
-        const usage = usageStats.get(se.name)
-        skills.push({
-          name: se.name,
-          description: extractDescription(skillMd),
-          enabled: !disabledList.includes(se.name),
-          source,
-          modified: modified || undefined,
-          patchCount: usage?.patch_count,
-          useCount: usage?.use_count,
-          viewCount: usage?.view_count,
-          pinned: usage?.pinned || undefined,
-        })
       }
+      return results
     }
+    skills.push(...await collectSkills(catDir))
     if (skills.length > 0) {
       categories.push({ name: cat.name, description: cat.description, skills })
     }
@@ -198,10 +314,63 @@ async function scanSkillsDir(skillsDir: string, bundledManifest: Map<string, str
   return categories
 }
 
+async function scanExternalSkillsDir(skillsDir: string, disabledList: string[], usageStats: Map<string, UsageStats>) {
+  return scanSkillsDir(skillsDir, new Map(), new Set(), disabledList, usageStats).then(categories =>
+    categories.map(category => ({
+      ...category,
+      skills: category.skills.map((skill: any) => ({
+        ...skill,
+        source: 'external' as SkillSource,
+        modified: undefined,
+      })),
+    })),
+  )
+}
+
+function collectSkillNames(categories: any[]): Set<string> {
+  const names = new Set<string>()
+  for (const category of categories) {
+    for (const skill of category.skills || []) {
+      if (skill?.name) names.add(skill.name)
+    }
+  }
+  return names
+}
+
+function mergeExternalCategories(categories: any[], externalCategories: any[]): any[] {
+  const byName = new Map<string, any>()
+  for (const category of categories) {
+    byName.set(category.name, { ...category, skills: [...category.skills] })
+  }
+
+  const seenSkills = collectSkillNames(categories)
+  for (const externalCategory of externalCategories) {
+    const target = byName.get(externalCategory.name) || {
+      name: externalCategory.name,
+      description: externalCategory.description,
+      skills: [],
+    }
+    for (const skill of externalCategory.skills || []) {
+      if (seenSkills.has(skill.name)) continue
+      seenSkills.add(skill.name)
+      target.skills.push(skill)
+    }
+    if (target.skills.length > 0) byName.set(target.name, target)
+  }
+
+  const merged = [...byName.values()]
+    .filter(category => category.skills.length > 0)
+    .sort((a, b) => a.name.localeCompare(b.name))
+  for (const category of merged) {
+    category.skills.sort((a: any, b: any) => a.name.localeCompare(b.name))
+  }
+  return merged
+}
+
 export async function list(ctx: any) {
-  const skillsDir = join(getHermesDir(), 'skills')
+  const skillsDir = requestSkillsDir(ctx)
   try {
-    const config = await readConfigYaml()
+    const config = await readConfigYamlForProfile(requestedProfile(ctx))
     const disabledList: string[] = config.skills?.disabled || []
 
     // Read provenance sources
@@ -210,7 +379,11 @@ export async function list(ctx: any) {
     const usageStats = readUsageStats(await safeReadFile(join(skillsDir, '.usage.json')))
 
     // Scan all skills (supports both two-level and three-level directory structures)
-    const categories = await scanSkillsDir(skillsDir, bundledManifest, hubNames, disabledList, usageStats)
+    let categories = await scanSkillsDir(skillsDir, bundledManifest, hubNames, disabledList, usageStats)
+    for (const externalDir of await resolveExternalSkillsDirs(config, skillsDir)) {
+      const externalCategories = await scanExternalSkillsDir(externalDir, disabledList, usageStats)
+      categories = mergeExternalCategories(categories, externalCategories)
+    }
 
     // Read archived skills from .archive/
     const archived: any[] = []
@@ -246,7 +419,7 @@ export async function usageStats(ctx: any) {
   const days = Number.isFinite(rawDays) && rawDays > 0 ? Math.min(rawDays, 365) : 7
 
   try {
-    ctx.body = await getSkillUsageStatsFromDb(days)
+    ctx.body = await getSkillUsageStatsFromDb(days, undefined, requestedProfile(ctx))
   } catch (err: any) {
     ctx.status = 500
     ctx.body = { error: `Failed to read skill usage stats: ${err.message}` }
@@ -261,7 +434,7 @@ export async function toggle(ctx: any) {
     return
   }
   try {
-    await updateConfigYaml((config) => {
+    await updateConfigYamlForProfile(requestedProfile(ctx), (config) => {
       if (!config.skills) config.skills = {}
       if (!Array.isArray(config.skills.disabled)) config.skills.disabled = []
       const disabled = config.skills.disabled as string[]
@@ -279,13 +452,17 @@ export async function toggle(ctx: any) {
 
 export async function listFiles(ctx: any) {
   const { category, skill } = ctx.params
-  const hd = getHermesDir()
-  // Handle "misc" category: real skill dir is skills/<skill>, not skills/misc/<skill>
-  const realDir = category === 'misc' ? skill : join(category, skill)
-  const skillDir = join(hd, 'skills', realDir)
+  const profileSkillsDir = requestSkillsDir(ctx)
   try {
+    const config = await readConfigYamlForProfile(requestedProfile(ctx))
+    const skillDir = await resolveSkillDirFromConfig(config, profileSkillsDir, category, skill)
+    if (!skillDir) {
+      ctx.status = 404
+      ctx.body = { error: 'Skill not found' }
+      return
+    }
     const allFiles = await listFilesRecursive(skillDir, '')
-    const files = allFiles.filter(f => f.path !== 'SKILL.md')
+    const files = allFiles.filter((f: any) => f.path !== 'SKILL.md')
     ctx.body = { files }
   } catch (err: any) {
     ctx.status = 500
@@ -295,25 +472,63 @@ export async function listFiles(ctx: any) {
 
 export async function readFile_(ctx: any) {
   const filePath = (ctx.params as any).path
-  const hd = getHermesDir()
-  // Handle "misc" category: real skill dir is skills/<skill>, not skills/misc/<skill>
+  const profileSkillsDir = requestSkillsDir(ctx)
+  // Handle 'misc' category: real skill dir is skills/<skill>, not skills/misc/<skill>
   let realPath = filePath
   if (filePath.startsWith('misc/')) {
     realPath = filePath.slice(5)
   }
-  const fullPath = resolve(join(hd, 'skills', realPath))
-  if (!isPathWithin(fullPath, join(hd, 'skills'))) {
+  const fullPath = resolve(join(profileSkillsDir, realPath))
+  if (!isPathWithin(fullPath, profileSkillsDir)) {
     ctx.status = 403
     ctx.body = { error: 'Access denied' }
     return
   }
-  const content = await safeReadFile(fullPath)
+  let content = await safeReadFile(fullPath)
   if (content === null) {
+    // Fallback: recursive search for nested skills (e.g., mlops/lm-evaluation-harness/SKILL.md
+    // where actual path is mlops/evaluation/lm-evaluation-harness/SKILL.md)
+    const parts = filePath.split('/')
+    if (parts.length >= 2) {
+      const category = parts[0]
+      const skillName = parts[1]
+      const restPath = parts.slice(2).join('/')
+      const config = await readConfigYamlForProfile(requestedProfile(ctx))
+      const skillDir = await resolveSkillDirFromConfig(config, profileSkillsDir, category, skillName)
+      if (skillDir) {
+        const resolvedPath = resolve(join(skillDir, restPath))
+        if (isPathWithin(resolvedPath, skillDir)) {
+          const nestedContent = await safeReadFile(resolvedPath)
+          if (nestedContent !== null) {
+            ctx.body = { content: nestedContent }
+            return
+          }
+        }
+      }
+    }
     ctx.status = 404
     ctx.body = { error: 'File not found' }
     return
   }
   ctx.body = { content }
+}
+
+async function updatePinnedSkill(skillsDir: string, name: string, pinned: boolean): Promise<void> {
+  await mkdir(skillsDir, { recursive: true })
+  const usagePath = join(skillsDir, '.usage.json')
+  let usage: Record<string, any> = {}
+  const raw = await safeReadFile(usagePath)
+  if (raw) {
+    try {
+      const parsed = JSON.parse(raw)
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) usage = parsed
+    } catch { /* rewrite malformed usage file with the requested pin state */ }
+  }
+  const current = usage[name]
+  usage[name] = current && typeof current === 'object' && !Array.isArray(current)
+    ? { ...current, pinned }
+    : { patch_count: 0, use_count: 0, view_count: 0, pinned }
+  await writeFile(usagePath, `${JSON.stringify(usage, null, 2)}\n`, 'utf-8')
 }
 
 export async function pin_(ctx: any) {
@@ -324,7 +539,7 @@ export async function pin_(ctx: any) {
     return
   }
   try {
-    await pinSkill(name, pinned)
+    await updatePinnedSkill(requestSkillsDir(ctx), name, pinned)
     ctx.body = { success: true }
   } catch (err: any) {
     ctx.status = 500

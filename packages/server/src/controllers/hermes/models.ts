@@ -2,18 +2,20 @@ import { readFile } from 'fs/promises'
 import { existsSync, readFileSync } from 'fs'
 import { join } from 'path'
 import { getActiveEnvPath, getActiveAuthPath, getActiveProfileName, getProfileDir, listProfileNamesFromDisk } from '../../services/hermes/hermes-profile'
-import { readConfigYaml, readConfigYamlForProfile, updateConfigYaml, fetchProviderModels, buildModelGroups, PROVIDER_ENV_MAP } from '../../services/config-helpers'
+import { readConfigYaml, readConfigYamlForProfile, updateConfigYaml, updateConfigYamlForProfile, fetchProviderModels, buildModelGroups, PROVIDER_ENV_MAP } from '../../services/config-helpers'
 import { buildProviderModelMap, PROVIDER_PRESETS } from '../../shared/providers'
 import { getCopilotModelsDetailed, resolveCopilotOAuthToken, type CopilotModelMeta } from '../../services/hermes/copilot-models'
 import { readAppConfig, writeAppConfig, type ModelVisibilityRule } from '../../services/app-config'
 import { getDb } from '../../db'
 import { MODEL_CONTEXT_TABLE } from '../../db/hermes/schemas'
+import { listUserProfiles } from '../../db/hermes/users-store'
 
 const PROVIDER_MODEL_CATALOG = buildProviderModelMap()
 
 type ModelMeta = { preview?: boolean; disabled?: boolean; alias?: string }
-type AvailableGroup = { provider: string; label: string; base_url: string; models: string[]; api_key: string; builtin?: boolean; model_meta?: Record<string, ModelMeta>; available_models?: string[] }
+type AvailableGroup = { provider: string; label: string; base_url: string; models: string[]; api_key: string; builtin?: boolean; model_meta?: Record<string, ModelMeta>; available_models?: string[]; base_url_env?: string }
 type ModelVisibility = Record<string, ModelVisibilityRule>
+type CustomModels = Record<string, string[]>
 
 const RESERVED_ALIAS_KEYS = new Set(['__proto__', 'prototype', 'constructor'])
 
@@ -65,6 +67,41 @@ function applyModelAliases<T extends { provider: string; models: string[]; model
 function uniqueStrings(values: unknown): string[] {
   if (!Array.isArray(values)) return []
   return Array.from(new Set(values.map(v => String(v || '').trim()).filter(Boolean)))
+}
+
+function normalizeCustomModels(input: unknown): CustomModels {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return {}
+  const out: CustomModels = {}
+  for (const [provider, rawModels] of Object.entries(input as Record<string, unknown>)) {
+    const providerKey = String(provider || '').trim()
+    if (!providerKey) continue
+    const models = uniqueStrings(rawModels)
+    if (models.length > 0) out[providerKey] = models
+  }
+  return out
+}
+
+function applyCustomModels(groups: AvailableGroup[], customModels: CustomModels): AvailableGroup[] {
+  return groups.map(group => {
+    const extra = customModels[group.provider] || []
+    if (!extra.length) return group
+    const models = [...new Set([...group.models, ...extra])]
+    const availableModels = [...new Set([...(group.available_models || group.models), ...extra])]
+    return { ...group, models, available_models: availableModels }
+  })
+}
+
+function providerPresetToGroup(p: any, models?: string[]): AvailableGroup {
+  const envMapping = PROVIDER_ENV_MAP[p.value]
+  return {
+    provider: p.value,
+    label: p.label,
+    base_url: p.base_url,
+    models: models || p.models,
+    api_key: '',
+    ...(p.builtin ? { builtin: true } : {}),
+    ...(envMapping?.base_url_env ? { base_url_env: envMapping.base_url_env } : {}),
+  }
 }
 
 function normalizeModelVisibility(input: unknown): ModelVisibility {
@@ -145,6 +182,27 @@ function providerKeyForCustom(name: string): string {
   return `custom:${name.trim().toLowerCase().replace(/ /g, '-')}`
 }
 
+function providerKeyWithoutCustomPrefix(providerKey: string): string {
+  return providerKey.startsWith('custom:') ? providerKey.slice('custom:'.length) : providerKey
+}
+
+function isBuiltinProviderKey(providerKey: string): boolean {
+  const normalized = providerKeyWithoutCustomPrefix(providerKey)
+  return PROVIDER_PRESETS.some((preset: any) => preset.value === normalized && preset.builtin === true)
+}
+
+function providerShouldFetchLiveModels(providerKey: string): boolean {
+  return providerKey === 'openrouter' ||
+    providerKey === 'cliproxyapi' ||
+    providerKey === 'ollama-cloud' ||
+    providerKey === 'lmstudio'
+}
+
+function includeConfiguredDefaultModel(providerKey: string, modelsList: string[], currentDefault: string, currentDefaultProvider: string): string[] {
+  if (!currentDefault || providerKey !== currentDefaultProvider) return modelsList
+  return [...new Set([...modelsList, currentDefault])]
+}
+
 function mergeAvailableGroups(groups: AvailableGroup[]): AvailableGroup[] {
   const byProvider = new Map<string, AvailableGroup>()
   for (const group of groups) {
@@ -170,6 +228,31 @@ function mergeAvailableGroups(groups: AvailableGroup[]): AvailableGroup[] {
 }
 
 type ProviderFetchCache = Map<string, Promise<string[]>>
+
+function requestedProfileName(ctx: any): string {
+  const queryProfile = ctx.query?.profile
+  return typeof queryProfile === 'string' && queryProfile.trim() ? queryProfile.trim() : ''
+}
+
+function requestScopedProfileName(ctx: any): string {
+  const headerProfile = typeof ctx.get === 'function' ? ctx.get('x-hermes-profile') : ''
+  const queryProfile = typeof ctx.query?.profile === 'string' ? ctx.query.profile : ''
+  const bodyProfile = typeof ctx.request?.body?.profile === 'string' ? ctx.request.body.profile : ''
+  return ctx.state?.profile?.name ||
+    headerProfile.trim() ||
+    queryProfile.trim() ||
+    bodyProfile.trim() ||
+    getActiveProfileName() ||
+    'default'
+}
+
+function visibleProfileNamesForUser(ctx: any): string[] {
+  const diskProfiles = listProfileNamesFromDisk()
+  const user = ctx.state?.user
+  if (!user || user.role === 'super_admin') return diskProfiles
+  const allowed = new Set(listUserProfiles(user.id).map(profile => profile.profile_name))
+  return diskProfiles.filter(profile => allowed.has(profile))
+}
 
 function cachedProviderModels(
   cache: ProviderFetchCache,
@@ -298,15 +381,18 @@ async function buildAvailableForProfile(
         }
         if (Object.keys(modelMeta).length === 0) modelMeta = undefined
       }
-    } else if (providerKey === 'openrouter' || providerKey === 'cliproxyapi' || providerKey === 'ollama-cloud') {
+    } else if (providerShouldFetchLiveModels(providerKey)) {
       if (envMapping.api_key_env) {
         const apiKey = envGetValue(envMapping.api_key_env)
         if (apiKey) {
-          const fetched = await cachedProviderModels(fetchCache, baseUrl, apiKey, providerKey === 'openrouter')
-          if (fetched.length > 0) modelsList = fetched
+          try {
+            const fetched = await cachedProviderModels(fetchCache, baseUrl, apiKey, providerKey === 'openrouter')
+            if (fetched.length > 0) modelsList = fetched
+          } catch { /* ignore live catalog failures */ }
         }
       }
     }
+    modelsList = includeConfiguredDefaultModel(providerKey, modelsList, currentDefault, currentDefaultProvider)
     if (modelsList.length > 0) {
       const apiKey = envMapping.api_key_env ? envGetValue(envMapping.api_key_env) : ''
       addGroup(providerKey, label, baseUrl, modelsList, apiKey, true, modelMeta)
@@ -326,13 +412,13 @@ async function buildAvailableForProfile(
         const fetched = await cachedProviderModels(fetchCache, baseUrl, cp.api_key)
         if (fetched.length > 0) models = [...new Set([...models, ...fetched])]
       }
-      return { providerKey, label: cp.name, base_url: baseUrl, models, api_key: cp.api_key || '' }
+      return { providerKey, label: cp.name, base_url: baseUrl, models, api_key: cp.api_key || '', builtin: isBuiltinProviderKey(providerKey) }
     }),
   )
   for (const result of customFetches) {
     if (result.status === 'fulfilled' && result.value?.models.length) {
-      const { providerKey, label, base_url, models, api_key } = result.value
-      addGroup(providerKey, label, base_url, models, api_key)
+      const { providerKey, label, base_url, models, api_key, builtin } = result.value
+      addGroup(providerKey, label, base_url, models, api_key, builtin)
     }
   }
 
@@ -349,27 +435,28 @@ async function buildAvailableForProfile(
     g.models = Array.from(new Set(g.models))
     g.available_models = Array.from(new Set(g.available_models || g.models))
   }
+  const groupsWithCustomModels = applyCustomModels(groups, normalizeCustomModels(appConfig.customModels))
 
-  return { profile, default: currentDefault, default_provider: currentDefaultProvider, groups }
+  return { profile, default: currentDefault, default_provider: currentDefaultProvider, groups: groupsWithCustomModels }
 }
 
 export async function getAvailable(ctx: any) {
   try {
-    const requestedProfile = typeof ctx.query.profile === 'string' && ctx.query.profile.trim()
-      ? ctx.query.profile.trim()
-      : ''
+    const requestedProfile = requestedProfileName(ctx)
     if (!requestedProfile) {
       const appConfig = await readAppConfig()
       const modelAliases = normalizeAliases(appConfig.modelAliases)
       const modelVisibility = normalizeModelVisibility(appConfig.modelVisibility)
+      const customModels = normalizeCustomModels(appConfig.customModels)
       const fetchCache: ProviderFetchCache = new Map()
+      const visibleProfiles = visibleProfileNamesForUser(ctx)
       const profileResults = await Promise.all(
-        listProfileNamesFromDisk().map(profile => buildAvailableForProfile(profile, fetchCache, appConfig)),
+        visibleProfiles.map(profile => buildAvailableForProfile(profile, fetchCache, appConfig)),
       )
       const mergedGroups = mergeAvailableGroups(profileResults.flatMap(result => result.groups))
       const groupsWithAliases = applyModelAliases(mergedGroups, modelAliases)
       const visibleGroups = applyModelVisibility(groupsWithAliases, modelVisibility)
-      const activeProfile = getActiveProfileName()
+      const activeProfile = requestScopedProfileName(ctx)
       const defaultProfile = profileResults.find(result => result.profile === activeProfile && (result.default || result.default_provider))
         || profileResults.find(result => result.default && result.default_provider)
         || profileResults.find(result => result.default)
@@ -378,13 +465,7 @@ export async function getAvailable(ctx: any) {
         defaultProfile?.default_provider || '',
         visibleGroups,
       )
-      const allProvidersBase = PROVIDER_PRESETS.map((p: any) => ({
-        provider: p.value,
-        label: p.label,
-        base_url: p.base_url,
-        models: p.models,
-        api_key: '',
-      }))
+      const allProvidersBase = PROVIDER_PRESETS.map((p: any) => providerPresetToGroup(p))
       ctx.body = {
         default: visibleDefault.defaultModel,
         default_provider: visibleDefault.defaultProvider,
@@ -392,6 +473,7 @@ export async function getAvailable(ctx: any) {
         allProviders: applyModelAliases(allProvidersBase, modelAliases),
         model_aliases: modelAliases,
         model_visibility: modelVisibility,
+        custom_models: customModels,
         profiles: profileResults.map(result => ({
           profile: result.profile,
           default: result.default,
@@ -405,6 +487,7 @@ export async function getAvailable(ctx: any) {
     const appConfigForProfile = await readAppConfig()
     const modelAliasesForProfile = normalizeAliases(appConfigForProfile.modelAliases)
     const modelVisibilityForProfile = normalizeModelVisibility(appConfigForProfile.modelVisibility)
+    const customModelsForProfile = normalizeCustomModels(appConfigForProfile.customModels)
     const profileResult = await buildAvailableForProfile(requestedProfile, new Map(), appConfigForProfile)
     const profileGroupsWithAliases = applyModelAliases(profileResult.groups, modelAliasesForProfile)
     const visibleProfileGroups = applyModelVisibility(profileGroupsWithAliases, modelVisibilityForProfile)
@@ -413,15 +496,10 @@ export async function getAvailable(ctx: any) {
       default: visibleProfileDefault.defaultModel,
       default_provider: visibleProfileDefault.defaultProvider,
       groups: visibleProfileGroups,
-      allProviders: applyModelAliases(PROVIDER_PRESETS.map((p: any) => ({
-        provider: p.value,
-        label: p.label,
-        base_url: p.base_url,
-        models: p.models,
-        api_key: '',
-      })), modelAliasesForProfile),
+      allProviders: applyModelAliases(PROVIDER_PRESETS.map((p: any) => providerPresetToGroup(p)), modelAliasesForProfile),
       model_aliases: modelAliasesForProfile,
       model_visibility: modelVisibilityForProfile,
+      custom_models: customModelsForProfile,
       profiles: [{
         profile: profileResult.profile,
         default: profileResult.default,
@@ -511,6 +589,7 @@ export async function getAvailable(ctx: any) {
     const copilotEnabled = appConfig.copilotEnabled === true
     const modelAliases = normalizeAliases(appConfig.modelAliases)
     const modelVisibility = normalizeModelVisibility(appConfig.modelVisibility)
+    const customModels = normalizeCustomModels(appConfig.customModels)
 
     // 兼容老用户：上一版本会"自动 fallback discovery"出 Copilot；升级后这些用户的
     // config.yaml 可能仍把 model.default 指向某个 copilot 模型。若此时 copilot 已不
@@ -554,8 +633,8 @@ export async function getAvailable(ctx: any) {
           }
           modelMeta = Object.keys(nextModelMeta).length > 0 ? nextModelMeta : undefined
         }
-      } else if (providerKey === 'openrouter' || providerKey === 'cliproxyapi' || providerKey === 'ollama-cloud') {
-        // OpenRouter and local CLIProxyAPI expose dynamic OpenAI-compatible /models catalogs.
+      } else if (providerShouldFetchLiveModels(providerKey)) {
+        // These providers expose dynamic OpenAI-compatible /models catalogs.
         if (envMapping.api_key_env) {
           const apiKey = envGetValue(envMapping.api_key_env)
           if (apiKey) {
@@ -566,6 +645,7 @@ export async function getAvailable(ctx: any) {
           }
         }
       }
+      modelsList = includeConfiguredDefaultModel(providerKey, modelsList, currentDefault, currentDefaultProvider)
       if (modelsList.length > 0) {
         const apiKey = envMapping.api_key_env ? envGetValue(envMapping.api_key_env) : ''
         addGroup(providerKey, label, baseUrl, modelsList, apiKey, true, modelMeta)
@@ -585,7 +665,7 @@ export async function getAvailable(ctx: any) {
         if (cp.api_key) {
           try { const fetched = await fetchProviderModels(baseUrl, cp.api_key); if (fetched.length > 0) models = [...new Set([cp.model, ...fetched])] } catch { }
         }
-        return { providerKey, label: cp.name, base_url: baseUrl, models, api_key: cp.api_key || '' }
+        return { providerKey, label: cp.name, base_url: baseUrl, models, api_key: cp.api_key || '', builtin: isBuiltinProviderKey(providerKey) }
       }),
     )
 
@@ -598,7 +678,7 @@ export async function getAvailable(ctx: any) {
     }
 
     for (const g of groups) { g.models = Array.from(new Set(g.models)) }
-    const groupsWithAliases = applyModelAliases(groups, modelAliases)
+    const groupsWithAliases = applyModelAliases(applyCustomModels(groups, customModels), modelAliases)
     const visibleGroups = applyModelVisibility(groupsWithAliases, modelVisibility)
     const visibleDefault = resolveVisibleDefault(currentDefault, currentDefaultProvider, visibleGroups)
 
@@ -607,12 +687,10 @@ export async function getAvailable(ctx: any) {
     const liveCopilotModels = copilotEnabled ? await getCopilotLive() : []
     const liveCopilotIds = liveCopilotModels.map((m) => m.id)
 
-    const allProvidersBase = PROVIDER_PRESETS.map((p: any) => ({
-      provider: p.value,
-      label: p.label,
-      base_url: p.base_url,
-      models: p.value === 'copilot' && liveCopilotIds.length > 0 ? liveCopilotIds : p.models,
-    }))
+    const allProvidersBase = PROVIDER_PRESETS.map((p: any) => providerPresetToGroup(
+      p,
+      p.value === 'copilot' && liveCopilotIds.length > 0 ? liveCopilotIds : p.models,
+    ))
     const allProviders = applyModelAliases(allProvidersBase, modelAliases)
 
     if (groups.length === 0) {
@@ -638,6 +716,7 @@ export async function getAvailable(ctx: any) {
         allProviders,
         model_aliases: modelAliases,
         model_visibility: modelVisibility,
+        custom_models: customModels,
       }
       return
     }
@@ -649,7 +728,56 @@ export async function getAvailable(ctx: any) {
       allProviders,
       model_aliases: modelAliases,
       model_visibility: modelVisibility,
+      custom_models: customModels,
     }
+  } catch (err: any) {
+    ctx.status = 500
+    ctx.body = { error: err.message }
+  }
+}
+
+export async function addCustomModel(ctx: any) {
+  const { provider, model } = (ctx.request.body || {}) as { provider?: string; model?: string }
+  const providerKey = String(provider || '').trim()
+  const modelId = String(model || '').trim()
+  if (!providerKey || !modelId) {
+    ctx.status = 400
+    ctx.body = { error: 'Missing provider or model' }
+    return
+  }
+
+  try {
+    const appConfig = await readAppConfig()
+    const customModels = normalizeCustomModels(appConfig.customModels)
+    customModels[providerKey] = Array.from(new Set([...(customModels[providerKey] || []), modelId]))
+    const saved = await writeAppConfig({ customModels })
+    ctx.body = { success: true, custom_models: normalizeCustomModels(saved.customModels) }
+  } catch (err: any) {
+    ctx.status = 500
+    ctx.body = { error: err.message }
+  }
+}
+
+export async function removeCustomModel(ctx: any) {
+  const body = (ctx.request.body || {}) as { provider?: string; model?: string }
+  const provider = body.provider ?? ctx.query?.provider
+  const model = body.model ?? ctx.query?.model
+  const providerKey = String(provider || '').trim()
+  const modelId = String(model || '').trim()
+  if (!providerKey || !modelId) {
+    ctx.status = 400
+    ctx.body = { error: 'Missing provider or model' }
+    return
+  }
+
+  try {
+    const appConfig = await readAppConfig()
+    const customModels = normalizeCustomModels(appConfig.customModels)
+    const remaining = (customModels[providerKey] || []).filter(item => item !== modelId)
+    if (remaining.length > 0) customModels[providerKey] = remaining
+    else delete customModels[providerKey]
+    const saved = await writeAppConfig({ customModels })
+    ctx.body = { success: true, custom_models: normalizeCustomModels(saved.customModels) }
   } catch (err: any) {
     ctx.status = 500
     ctx.body = { error: err.message }
@@ -767,7 +895,7 @@ export async function setModelAlias(ctx: any) {
 
 export async function getConfigModels(ctx: any) {
   try {
-    const config = await readConfigYaml()
+    const config = await readConfigYamlForProfile(requestScopedProfileName(ctx))
     ctx.body = buildModelGroups(config)
   } catch (err: any) {
     ctx.status = 500
@@ -783,7 +911,8 @@ export async function setConfigModel(ctx: any) {
     return
   }
   try {
-    await updateConfigYaml((config) => {
+    const profile = requestScopedProfileName(ctx)
+    await updateConfigYamlForProfile(profile, (config) => {
       config.model = {}
       config.model.default = defaultModel
       if (reqProvider) { config.model.provider = reqProvider }

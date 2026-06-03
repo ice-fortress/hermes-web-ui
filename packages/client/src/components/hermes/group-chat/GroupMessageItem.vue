@@ -2,8 +2,9 @@
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useMessage } from 'naive-ui'
-import multiavatar from '@multiavatar/multiavatar'
 import MarkdownRenderer from '../chat/MarkdownRenderer.vue'
+import ProfileAvatar from '@/components/hermes/profiles/ProfileAvatar.vue'
+import { useProfilesStore } from '@/stores/hermes/profiles'
 import {
     copyTextToClipboard,
     handleCodeBlockCopyClick,
@@ -14,7 +15,7 @@ import { useGlobalSpeech } from '@/composables/useSpeech'
 import { useVoiceSettings } from '@/composables/useVoiceSettings'
 import { speedToEdgeRate, hzToEdgePitch } from '@/utils/ttsHelpers'
 import { getDownloadUrl } from '@/api/hermes/download'
-import type { ChatMessage, RoomAgent } from '@/api/hermes/group-chat'
+import type { ChatMessage, RoomAgent, MemberInfo } from '@/api/hermes/group-chat'
 
 const TOOL_PAYLOAD_DISPLAY_LIMIT = 1000
 const JSON_STRING_DISPLAY_LIMIT = 200
@@ -27,16 +28,24 @@ const JSON_TRUNCATED_KEY = '__truncated__'
 const props = defineProps<{
     message: ChatMessage
     agents: RoomAgent[]
+    members?: MemberInfo[]
     currentUserId?: string
 }>()
 
 const { t } = useI18n()
 const toast = useMessage()
+const profilesStore = useProfilesStore()
 const speech = useGlobalSpeech()
 const voiceSettings = useVoiceSettings()
 const previewUrl = ref<string | null>(null)
 const isAgent = computed(() => {
     return props.agents.some(a => a.agentId === props.message.senderId || a.name === props.message.senderName)
+})
+
+const isAgentError = computed(() => {
+    if (props.message.role !== 'assistant') return false
+    if (props.message.finish_reason === 'error') return true
+    return /^Error:\s*/i.test(props.message.content || '')
 })
 
 const isSelf = computed(() => {
@@ -52,8 +61,41 @@ const timeStr = computed(() => {
     return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
 })
 
-const avatarSvg = computed(() => {
-    return multiavatar(props.message.senderName || props.message.senderId)
+const avatarProfileName = computed(() => agentInfo.value?.profile || props.message.senderName || props.message.senderId)
+const avatarProfile = computed(() => profilesStore.profiles.find(profile => profile.name === agentInfo.value?.profile))
+
+// 找当前消息发送者在 members 里的记录
+const memberInfo = computed(() => {
+    if (isAgent.value) return null
+    return props.members?.find(m =>
+        m.userId === props.message.senderId ||
+        m.name === props.message.senderName
+    ) || null
+})
+
+// 解析 member 的 avatar JSON
+const memberAvatar = computed(() => {
+    const av = memberInfo.value?.avatar
+    if (!av) return null
+    try {
+        const parsed = typeof av === 'string' ? JSON.parse(av) : av
+        if (parsed && parsed.type === 'image' && parsed.dataUrl) return parsed
+    } catch {}
+    return null
+})
+
+// 当前消息要显示的头像(profile / member / fallback)
+const currentAvatar = computed(() => {
+    if (isAgent.value) {
+        return avatarProfile.value?.avatar ?? null
+    }
+    return memberAvatar.value
+})
+
+// 给 ProfileAvatar 的 name seed
+const avatarDisplayName = computed(() => {
+    if (isAgent.value) return avatarProfileName.value
+    return props.message.senderName || props.message.senderId || 'user'
 })
 
 const mentionNames = computed(() => ['all', ...props.agents.map(a => a.name).filter(Boolean)])
@@ -325,10 +367,7 @@ function playSpeech(content: string, autoplay = false) {
         return
     }
     if (voiceSettings.provider.value === 'webspeech') {
-        const text = speech.extractReadableText(content)
-        if (!text) return
-        speech.stop(false)
-        speech.speakViaBrowser(props.message.id, text, {
+        speech.toggleBrowser(props.message.id, content, {
             voiceName: voiceSettings.webspeechVoice.value || undefined,
         })
         return
@@ -384,7 +423,7 @@ onBeforeUnmount(() => {
 <template>
     <div v-if="isToolMessage" class="group-message tool-message">
         <div class="avatar">
-            <span v-html="avatarSvg" />
+            <ProfileAvatar :name="avatarDisplayName" :avatar="currentAvatar" :size="36" />
         </div>
 
         <div class="msg-body">
@@ -430,7 +469,7 @@ onBeforeUnmount(() => {
     <div v-else class="group-message" :class="{ agent: isAgent, self: isSelf }">
         <!-- Avatar -->
         <div class="avatar">
-            <span v-html="avatarSvg" />
+            <ProfileAvatar :name="avatarDisplayName" :avatar="currentAvatar" :size="36" />
         </div>
 
         <div class="msg-body">
@@ -442,6 +481,7 @@ onBeforeUnmount(() => {
                 class="msg-content"
                 :class="{
                     'agent-content': isAgent,
+                    'agent-error': isAgentError,
                     'speech-playing': isPlayingThisMessage && !isPausedThisMessage,
                 }"
             >
@@ -530,6 +570,8 @@ onBeforeUnmount(() => {
     display: flex;
     gap: 10px;
     padding: 2px 0;
+    min-width: 0;
+    max-width: 100%;
 
     &.self {
         flex-direction: row-reverse;
@@ -545,6 +587,20 @@ onBeforeUnmount(() => {
 
     &.agent .msg-content.agent-content {
         background-color: rgba(var(--accent-primary-rgb), 0.06);
+    }
+
+    &.agent .msg-content.agent-error {
+        color: $error;
+        background-color: rgba(var(--error-rgb), 0.06);
+        border: 1px solid rgba(var(--error-rgb), 0.2);
+
+        :deep(.markdown-body),
+        :deep(.markdown-body p),
+        :deep(.markdown-body li),
+        :deep(.markdown-body strong),
+        :deep(.markdown-body code) {
+            color: $error;
+        }
     }
 
     &.self .msg-content {
@@ -564,6 +620,9 @@ onBeforeUnmount(() => {
     border-radius: $radius-sm;
     color: $text-muted;
     font-size: 11px;
+    min-width: 0;
+    max-width: 100%;
+    box-sizing: border-box;
 
     &.expandable {
         cursor: pointer;
@@ -590,17 +649,24 @@ onBeforeUnmount(() => {
 }
 
 .tool-name {
-    flex-shrink: 0;
+    flex: 0 1 auto;
+    min-width: 0;
     font-family: $font-code;
     color: $text-muted;
     font-weight: 400;
-}
-
-.tool-preview {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    max-width: 400px;
+}
+
+.tool-preview {
+    display: block;
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: min(400px, 100%);
 }
 
 .tool-spinner {
@@ -674,11 +740,6 @@ onBeforeUnmount(() => {
     margin-top: 2px;
     overflow: hidden;
     border-radius: 8px;
-
-    :deep(svg) {
-        width: 36px;
-        height: 36px;
-    }
 }
 
 .msg-body {
@@ -836,6 +897,20 @@ onBeforeUnmount(() => {
             0 0 10px rgba(255, 107, 107, 0.4),
             0 0 20px rgba(255, 107, 107, 0.2);
         animation: rainbow-glow 4s linear infinite;
+    }
+
+    &.agent-error {
+        color: $error;
+        background-color: rgba(var(--error-rgb), 0.06);
+        border: 1px solid rgba(var(--error-rgb), 0.2);
+
+        :deep(.markdown-body),
+        :deep(.markdown-body p),
+        :deep(.markdown-body li),
+        :deep(.markdown-body strong),
+        :deep(.markdown-body code) {
+            color: $error;
+        }
     }
 
     :deep(.mention-highlight) {

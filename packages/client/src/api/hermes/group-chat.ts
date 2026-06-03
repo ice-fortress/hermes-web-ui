@@ -23,6 +23,15 @@ export interface RoomAgent {
     invited: number
 }
 
+export interface AgentAddResult {
+    profile: string
+    ok: boolean
+    agent?: RoomAgent
+    code?: string
+    error?: string
+    reason?: string
+}
+
 export interface ChatMessage {
     id: string
     roomId: string
@@ -34,7 +43,7 @@ export interface ChatMessage {
     tool_call_id?: string | null
     tool_calls?: any[] | null
     tool_name?: string | null
-    finish_reason?: string | null
+    finish_reason?: 'streaming' | 'tool_calls' | 'error' | string | null
     reasoning?: string | null
     reasoning_details?: string | null
     reasoning_content?: string | null
@@ -54,6 +63,7 @@ export interface MemberInfo {
     name: string
     description: string
     joinedAt: number
+    avatar?: string
 }
 
 export interface JoinResult {
@@ -68,7 +78,7 @@ export interface JoinResult {
 
 let socket: ReturnType<typeof io> | null = null
 
-export function connectGroupChat(opts?: { userId?: string; userName?: string; description?: string }): ReturnType<typeof io> {
+export function connectGroupChat(opts?: { userId?: string; userName?: string; description?: string; authUserId?: number }): ReturnType<typeof io> {
     if (socket?.connected) return socket
 
     const token = getApiKey()
@@ -81,6 +91,7 @@ export function connectGroupChat(opts?: { userId?: string; userName?: string; de
             userId,
             name: opts?.userName || localStorage.getItem('gc_user_name') || undefined,
             description: opts?.description || localStorage.getItem('gc_user_description') || undefined,
+            authUserId: opts?.authUserId,
         },
         transports: ['websocket', 'polling'],
         reconnection: true,
@@ -133,7 +144,7 @@ export async function createRoom(data: {
     inviteCode: string
     agents?: { profile: string; name?: string; description?: string; invited?: boolean }[]
     compression?: { triggerTokens?: number; maxHistoryTokens?: number; tailMessageCount?: number }
-}): Promise<{ room: RoomInfo; agents: RoomAgent[] }> {
+}): Promise<{ room: RoomInfo; agents: RoomAgent[]; agentResults?: AgentAddResult[] }> {
     return request('/api/hermes/group-chat/rooms', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -141,7 +152,7 @@ export async function createRoom(data: {
     })
 }
 
-export async function cloneRoom(roomId: string, data?: { name?: string; inviteCode?: string }): Promise<{ room: RoomInfo; agents: RoomAgent[] }> {
+export async function cloneRoom(roomId: string, data?: { name?: string; inviteCode?: string }): Promise<{ room: RoomInfo; agents: RoomAgent[]; agentResults?: AgentAddResult[] }> {
     return request(`/api/hermes/group-chat/rooms/${roomId}/clone`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -153,8 +164,15 @@ export async function listRooms(): Promise<{ rooms: RoomInfo[] }> {
     return request('/api/hermes/group-chat/rooms')
 }
 
-export async function getRoomDetail(roomId: string): Promise<{ room: RoomInfo; messages: ChatMessage[]; agents: RoomAgent[]; members: MemberInfo[] }> {
-    return request(`/api/hermes/group-chat/rooms/${roomId}`)
+export async function getRoomDetail(
+    roomId: string,
+    options: { offset?: number; limit?: number } = {},
+): Promise<{ room: RoomInfo; messages: ChatMessage[]; agents: RoomAgent[]; members: MemberInfo[]; total?: number; offset?: number; limit?: number; hasMore?: boolean }> {
+    const params = new URLSearchParams()
+    if (options.offset != null) params.set('offset', String(options.offset))
+    if (options.limit != null) params.set('limit', String(options.limit))
+    const query = params.toString()
+    return request(`/api/hermes/group-chat/rooms/${roomId}${query ? `?${query}` : ''}`)
 }
 
 export async function joinRoomByCode(code: string): Promise<{ room: RoomInfo }> {
@@ -186,7 +204,7 @@ export async function listAgents(roomId: string): Promise<{ agents: RoomAgent[] 
     return request(`/api/hermes/group-chat/rooms/${roomId}/agents`)
 }
 
-export async function removeAgent(roomId: string, agentId: string): Promise<void> {
+export async function removeAgent(roomId: string, agentId: string): Promise<{ success: boolean; agents: RoomAgent[]; members: MemberInfo[] }> {
     return request(`/api/hermes/group-chat/rooms/${roomId}/agents/${agentId}`, {
         method: 'DELETE',
     })

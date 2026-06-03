@@ -2,21 +2,117 @@
 import { ref, onMounted } from "vue";
 import { NButton, NInput, NModal, NForm, NFormItem, NPopconfirm, useMessage } from "naive-ui";
 import { useI18n } from "vue-i18n";
-import { fetchAuthStatus, setupPassword, changePassword, changeUsername, removePassword, fetchLockedIps, unlockSpecificIp, unlockAllIps } from "@/api/auth";
-import type { LockedIp } from "@/api/auth";
+import { changePassword, changeUsername, fetchCurrentUser, fetchLockedIps, unlockSpecificIp, unlockAllIps, fetchMyAvatar, updateMyAvatar, resetMyAvatar } from "@/api/auth";
+import type { LockedIp, UserAvatar } from "@/api/auth";
+import ProfileAvatar from "@/components/hermes/profiles/ProfileAvatar.vue";
+import multiavatar from "@multiavatar/multiavatar";
 
 const { t } = useI18n();
 const message = useMessage();
 
-const hasPasswordLogin = ref(false);
 const username = ref<string | null>(null);
 const loading = ref(false);
 
-// Setup form
-const showSetupModal = ref(false);
-const setupUsername = ref("");
-const setupPasswordVal = ref("");
-const setupPasswordConfirm = ref("");
+// User avatar
+const avatar = ref<UserAvatar | null>(null);
+const avatarFileInput = ref<HTMLInputElement | null>(null);
+const avatarSaving = ref(false);
+
+function compressImage(file: File, maxBytes: number): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => {
+      const img = new Image()
+      img.onload = () => {
+        const canvas = document.createElement('canvas')
+        canvas.width = img.width
+        canvas.height = img.height
+        const ctx = canvas.getContext('2d')!
+        ctx.drawImage(img, 0, 0)
+        const tryCompress = (quality: number) => {
+          const result = canvas.toDataURL('image/jpeg', quality)
+          if (result.length <= maxBytes || quality <= 0.3) resolve(result)
+          else tryCompress(quality - 0.1)
+        }
+        tryCompress(0.8)
+      }
+      img.onerror = reject
+      img.src = reader.result as string
+    }
+    reader.onerror = reject
+    reader.readAsDataURL(file)
+  })
+}
+
+async function handleAvatarUpload(event: Event) {
+  const target = event.target as HTMLInputElement
+  const file = target.files?.[0]
+  if (!file) return
+  if (!['image/png', 'image/jpeg', 'image/webp'].includes(file.type)) {
+    message.error(t('settings.userAvatar.invalidType'))
+    target.value = ''
+    return
+  }
+  if (file.size > 1024 * 1024) {
+    message.error(t('settings.userAvatar.tooLarge'))
+    target.value = ''
+    return
+  }
+  avatarSaving.value = true
+  try {
+    let dataUrl: string
+    if (file.size > 500 * 1024) {
+      dataUrl = await compressImage(file, 500 * 1024)
+    } else {
+      dataUrl = await new Promise<string>((resolve, reject) => {
+        const r = new FileReader()
+        r.onload = () => resolve(r.result as string)
+        r.onerror = reject
+        r.readAsDataURL(file)
+      })
+    }
+    await updateMyAvatar({ type: 'image', dataUrl })
+    avatar.value = { type: 'image', dataUrl }
+    message.success(t('settings.userAvatar.saveSuccess'))
+  } catch (err: any) {
+    message.error(err.message || t('settings.userAvatar.saveFailed'))
+  } finally {
+    avatarSaving.value = false
+    target.value = ''
+  }
+}
+
+async function handleRandomAvatar() {
+  avatarSaving.value = true
+  try {
+    const randomPart = typeof crypto !== 'undefined' && 'randomUUID' in crypto
+      ? crypto.randomUUID()
+      : Math.random().toString(36).slice(2)
+    const seed = `${username.value || 'default'}-${Date.now()}-${randomPart}`
+    const svg = multiavatar(seed)
+    const dataUrl = 'data:image/svg+xml;base64,' + btoa(unescape(encodeURIComponent(svg)))
+    await updateMyAvatar({ type: 'image', dataUrl, seed })
+    avatar.value = { type: 'image', dataUrl, seed }
+    message.success(t('settings.userAvatar.saveSuccess'))
+  } catch (err: any) {
+    message.error(err.message || t('settings.userAvatar.saveFailed'))
+  } finally {
+    avatarSaving.value = false
+  }
+}
+
+async function handleResetAvatar() {
+  avatarSaving.value = true
+  try {
+    await resetMyAvatar()
+    avatar.value = { type: 'default', seed: username.value || 'default' }
+    message.success(t('settings.userAvatar.resetSuccess'))
+  } catch (err: any) {
+    message.error(err.message || t('settings.userAvatar.resetFailed'))
+  } finally {
+    avatarSaving.value = false
+  }
+}
 
 // Change password form
 const showChangePasswordModal = ref(false);
@@ -31,37 +127,14 @@ const newUsernameVal = ref("");
 
 onMounted(async () => {
   try {
-    const status = await fetchAuthStatus();
-    hasPasswordLogin.value = status.hasPasswordLogin;
-    username.value = status.username;
+    const user = await fetchCurrentUser();
+    username.value = user.username;
+  } catch { /* ignore */ }
+  try {
+    const av = await fetchMyAvatar();
+    avatar.value = av || { type: 'default', seed: username.value || 'default' };
   } catch { /* ignore */ }
 });
-
-async function handleSetup() {
-  if (setupPasswordVal.value !== setupPasswordConfirm.value) {
-    message.error(t("login.passwordMismatch"));
-    return;
-  }
-  if (setupPasswordVal.value.length < 6) {
-    message.error(t("login.passwordTooShort"));
-    return;
-  }
-  loading.value = true;
-  try {
-    await setupPassword(setupUsername.value, setupPasswordVal.value);
-    hasPasswordLogin.value = true;
-    username.value = setupUsername.value;
-    showSetupModal.value = false;
-    setupUsername.value = "";
-    setupPasswordVal.value = "";
-    setupPasswordConfirm.value = "";
-    message.success(t("login.setupSuccess"));
-  } catch (err: any) {
-    message.error(err.message || t("common.saveFailed"));
-  } finally {
-    loading.value = false;
-  }
-}
 
 async function handleChangePassword() {
   if (newPasswordVal.value !== newPasswordConfirm.value) {
@@ -105,27 +178,6 @@ async function handleChangeUsername() {
   } finally {
     loading.value = false;
   }
-}
-
-async function handleRemove() {
-  loading.value = true;
-  try {
-    await removePassword();
-    hasPasswordLogin.value = false;
-    username.value = null;
-    message.success(t("login.passwordRemoved"));
-  } catch (err: any) {
-    message.error(err.message || t("common.saveFailed"));
-  } finally {
-    loading.value = false;
-  }
-}
-
-function openSetupModal() {
-  setupUsername.value = "";
-  setupPasswordVal.value = "";
-  setupPasswordConfirm.value = "";
-  showSetupModal.value = true;
 }
 
 function openChangePasswordModal() {
@@ -187,25 +239,41 @@ onMounted(() => { loadLockedIps(); });
   <div class="account-settings">
     <p class="section-desc">{{ t("login.setupDescription") }}</p>
 
-    <!-- Not configured -->
-    <div v-if="!hasPasswordLogin" class="action-row">
-      <span class="action-label">{{ t("login.passwordLoginNotConfigured") }}</span>
-      <NButton type="primary" @click="openSetupModal">{{ t("login.setupPassword") }}</NButton>
+    <!-- User Avatar -->
+    <div class="avatar-section">
+      <h3 class="section-title">{{ t('settings.userAvatar.title') }}</h3>
+      <div class="avatar-row">
+        <div class="avatar-display">
+          <ProfileAvatar
+            :name="username || 'default'"
+            :avatar="avatar?.type === 'image' && avatar.dataUrl ? { type: 'image', dataUrl: avatar.dataUrl } : null"
+            :size="80"
+          />
+        </div>
+        <div class="avatar-actions">
+          <p class="avatar-hint">{{ t('settings.userAvatar.hint') }}</p>
+          <div class="action-buttons">
+            <NButton @click="avatarFileInput?.click()">{{ t('settings.userAvatar.upload') }}</NButton>
+            <NButton @click="handleRandomAvatar" :loading="avatarSaving">{{ t('settings.userAvatar.random') }}</NButton>
+            <NButton @click="handleResetAvatar" :loading="avatarSaving">{{ t('settings.userAvatar.reset') }}</NButton>
+          </div>
+          <input
+            ref="avatarFileInput"
+            type="file"
+            accept=".png,.jpg,.jpeg,.webp"
+            style="display: none"
+            @change="handleAvatarUpload"
+          />
+        </div>
+      </div>
     </div>
 
-    <!-- Configured -->
-    <div v-else class="configured-section">
+    <div class="configured-section">
       <div class="action-row">
         <span class="action-label">{{ t("login.passwordLoginConfigured", { username }) }}</span>
         <div class="action-buttons">
           <NButton @click="openChangePasswordModal">{{ t("login.changePassword") }}</NButton>
           <NButton @click="openChangeUsernameModal">{{ t("login.changeUsername") }}</NButton>
-          <NPopconfirm @positive-click="handleRemove">
-            <template #trigger>
-              <NButton type="error" ghost :loading="loading">{{ t("login.removePasswordLogin") }}</NButton>
-            </template>
-            {{ t("login.removeConfirm") }}
-          </NPopconfirm>
         </div>
       </div>
     </div>
@@ -237,25 +305,6 @@ onMounted(() => { loadLockedIps(); });
       </div>
       <p v-else class="empty-hint">{{ t("settings.lockedIps.empty") }}</p>
     </div>
-
-    <!-- Setup modal -->
-    <NModal v-model:show="showSetupModal" preset="dialog" :title="t('login.setupPassword')">
-      <NForm label-placement="top">
-        <NFormItem :label="t('login.username')">
-          <NInput v-model:value="setupUsername" :placeholder="t('login.usernamePlaceholder')" />
-        </NFormItem>
-        <NFormItem :label="t('login.newPassword')">
-          <NInput v-model:value="setupPasswordVal" type="password" show-password-on="click" :placeholder="t('login.passwordPlaceholder')" />
-        </NFormItem>
-        <NFormItem :label="t('login.confirmPassword')">
-          <NInput v-model:value="setupPasswordConfirm" type="password" show-password-on="click" :placeholder="t('login.confirmPassword')" @keyup.enter="handleSetup" />
-        </NFormItem>
-      </NForm>
-      <template #action>
-        <NButton @click="showSetupModal = false">{{ t("common.cancel") }}</NButton>
-        <NButton type="primary" :loading="loading" @click="handleSetup">{{ t("common.save") }}</NButton>
-      </template>
-    </NModal>
 
     <!-- Change password modal -->
     <NModal v-model:show="showChangePasswordModal" preset="dialog" :title="t('login.changePassword')">
@@ -384,5 +433,31 @@ onMounted(() => { loadLockedIps(); });
   font-size: 13px;
   color: $text-muted;
   margin: 0;
+}
+
+.avatar-section {
+  margin-bottom: 32px;
+  padding-bottom: 20px;
+  border-bottom: 1px solid $border-color;
+}
+
+.avatar-row {
+  display: flex;
+  align-items: center;
+  gap: 24px;
+}
+
+.avatar-display {
+  flex-shrink: 0;
+}
+
+.avatar-actions {
+  flex: 1;
+}
+
+.avatar-hint {
+  font-size: 12px;
+  color: $text-muted;
+  margin: 0 0 12px;
 }
 </style>

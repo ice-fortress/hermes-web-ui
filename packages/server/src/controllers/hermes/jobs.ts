@@ -1,18 +1,16 @@
 import type { Context } from 'koa'
-import { execFile } from 'child_process'
 import { existsSync, readFileSync } from 'fs'
 import { join } from 'path'
-import { promisify } from 'util'
 import { getHermesBin } from '../../services/hermes/hermes-path'
 import { getActiveProfileName, getProfileDir } from '../../services/hermes/hermes-profile'
+import { execHermesWithBin } from '../../services/hermes/hermes-process'
 
-const execFileAsync = promisify(execFile)
 const TIMEOUT_MS = 60_000
 
 type JobRecord = Record<string, any>
 
 function resolveProfile(ctx: Context): string {
-  const requestedProfile = ctx.get('x-hermes-profile') || (ctx.query.profile as string)
+  const requestedProfile = ctx.state?.profile?.name
   return requestedProfile || getActiveProfileName()
 }
 
@@ -119,7 +117,7 @@ function getSkills(body: Record<string, any>): string[] | null {
 async function runHermesCron(profile: string, args: string[]): Promise<void> {
   const profileDir = resolveProfileDir(profile)
   try {
-    await execFileAsync(getHermesBin(), args, {
+    await execHermesWithBin(getHermesBin(), args, {
       cwd: process.cwd(),
       env: { ...process.env, HERMES_HOME: profileDir },
       timeout: TIMEOUT_MS,

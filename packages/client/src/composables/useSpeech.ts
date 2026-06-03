@@ -1,5 +1,6 @@
 import { ref, computed, onUnmounted } from 'vue'
 import { generateSpeech, playAudioBlob } from '@/api/hermes/tts'
+import { getApiKey } from '@/api/client'
 
 export interface SpeechOptions {
   lang?: string      // 语言 'zh-CN', 'en-US' 等
@@ -286,6 +287,10 @@ export function useSpeech() {
     }
     if (opts.apiKey) {
       headers['Authorization'] = `Bearer ${opts.apiKey}`
+    } else if (opts.baseUrl.startsWith('/')) {
+      // 本地代理请求自动附加 JWT
+      const jwt = getApiKey()
+      if (jwt) headers['Authorization'] = `Bearer ${jwt}`
     }
 
     try {
@@ -550,6 +555,27 @@ export function useSpeech() {
     speak(messageId, text, options)
   }
 
+  function toggleBrowser(messageId: string, content: string, options: SpeechOptions = {}) {
+    if (state.value.currentMessageId && state.value.currentMessageId !== messageId) {
+      stop(false)
+    }
+
+    if (state.value.currentMessageId === messageId) {
+      if (state.value.isPaused) {
+        resume()
+      } else if (state.value.isPlaying) {
+        pause()
+      }
+      return
+    }
+
+    const text = extractReadableText(content)
+    if (!text) return
+
+    stop(false)
+    speakViaBrowser(messageId, text, options)
+  }
+
   function enqueue(messageId: string, content: string, options: SpeechOptions = {}) {
     if (!extractReadableText(content)) return
     speechQueue.push({ messageId, content, options })
@@ -560,7 +586,7 @@ export function useSpeech() {
     if (state.value.engine === 'tts' && currentAudio) {
       currentAudio.pause()
       state.value.isPaused = true
-    } else if (synth.speaking && !state.value.isPaused) {
+    } else if (state.value.engine === 'browser' && !state.value.isPaused) {
       synth.pause()
       state.value.isPaused = true
     }
@@ -613,6 +639,7 @@ export function useSpeech() {
     resume,
     stop,
     toggle,
+    toggleBrowser,
     enqueue,
     getDefaultVoice,
     extractReadableText,

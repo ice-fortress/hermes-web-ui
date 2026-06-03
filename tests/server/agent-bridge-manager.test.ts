@@ -48,6 +48,30 @@ describe('agent bridge manager command resolution', () => {
     })
   })
 
+  it('discovers hermes-agent from a global lib install next to the hermes command', async () => {
+    const installDir = join(tempDir, 'usr', 'local')
+    const binDir = join(installDir, 'bin')
+    const agentRoot = join(installDir, 'lib', 'hermes-agent')
+    const fakePython = join(binDir, 'python')
+    const fakeHermes = join(binDir, 'hermes')
+    const homeDir = join(tempDir, 'home')
+    mkdirSync(binDir, { recursive: true })
+    mkdirSync(agentRoot, { recursive: true })
+    mkdirSync(homeDir, { recursive: true })
+    writeFileSync(join(agentRoot, 'run_agent.py'), '')
+    writeFileSync(fakePython, '#!/bin/sh\n')
+    chmodSync(fakePython, 0o755)
+    writeFileSync(fakeHermes, `#!${fakePython}\n`)
+    chmodSync(fakeHermes, 0o755)
+    process.env.HERMES_HOME = homeDir
+    process.env.HERMES_BIN = fakeHermes
+
+    const { resolveAgentBridgeCommand } = await import('../../packages/server/src/services/hermes/agent-bridge/manager')
+    const command = resolveAgentBridgeCommand()
+
+    expect(command.agentRoot).toBe(agentRoot)
+  })
+
   it('falls back to system Python instead of uv when no source root exists', async () => {
     const homeDir = join(tempDir, 'home')
     const fakePython = join(tempDir, 'python3')
@@ -69,11 +93,42 @@ describe('agent bridge manager command resolution', () => {
     })
   })
 
+  it('injects Web UI OpenRouter attribution into the bridge process env by default', async () => {
+    const { buildAgentBridgeProcessEnv } = await import('../../packages/server/src/services/hermes/agent-bridge/manager')
+    const env = buildAgentBridgeProcessEnv('ipc:///tmp/test.sock', '/tmp/hermes-home', '/tmp/hermes-agent')
+
+    expect(env.HERMES_OPENROUTER_APP_REFERER).toBe('https://hermes-studio.ai')
+    expect(env.HERMES_OPENROUTER_APP_TITLE).toBe('Hermes Web UI')
+    expect(env.HERMES_OPENROUTER_APP_CATEGORIES).toBe('cli-agent,personal-agent')
+  })
+
+  it('keeps explicit OpenRouter attribution env values when starting the bridge', async () => {
+    process.env.HERMES_OPENROUTER_APP_REFERER = 'https://example.invalid/app'
+    process.env.HERMES_OPENROUTER_APP_TITLE = 'Custom App'
+    process.env.HERMES_OPENROUTER_APP_CATEGORIES = 'custom-category'
+
+    const { buildAgentBridgeProcessEnv } = await import('../../packages/server/src/services/hermes/agent-bridge/manager')
+    const env = buildAgentBridgeProcessEnv('ipc:///tmp/test.sock', '/tmp/hermes-home', undefined)
+
+    expect(env.HERMES_OPENROUTER_APP_REFERER).toBe('https://example.invalid/app')
+    expect(env.HERMES_OPENROUTER_APP_TITLE).toBe('Custom App')
+    expect(env.HERMES_OPENROUTER_APP_CATEGORIES).toBe('custom-category')
+  })
+
   it('uses an isolated default bridge endpoint while running under Vitest', async () => {
     const { DEFAULT_AGENT_BRIDGE_ENDPOINT } = await import('../../packages/server/src/services/hermes/agent-bridge/client')
 
     expect(DEFAULT_AGENT_BRIDGE_ENDPOINT).toContain(`hermes-agent-bridge-test-${process.pid}`)
     expect(DEFAULT_AGENT_BRIDGE_ENDPOINT).not.toBe('ipc:///tmp/hermes-agent-bridge.sock')
+  })
+
+  it('honors the bridge connect retry environment override', async () => {
+    process.env.HERMES_AGENT_BRIDGE_CONNECT_RETRY_MS = '120000'
+
+    const { AgentBridgeClient } = await import('../../packages/server/src/services/hermes/agent-bridge/client')
+    const client = new AgentBridgeClient({ endpoint: 'tcp://127.0.0.1:1' })
+
+    expect(client.connectRetryMs).toBe(120000)
   })
 
   it('waits briefly for a restarting bridge socket before failing', async () => {

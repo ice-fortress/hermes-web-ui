@@ -3,13 +3,14 @@ import type { Message, ContentBlock } from "@/stores/hermes/chat";
 import { computed, onBeforeUnmount, onMounted, ref, watchEffect } from "vue";
 import { useI18n } from "vue-i18n";
 import { useMessage } from "naive-ui";
-import { downloadFile } from "@/api/hermes/download";
-	import { getApiKey } from "@/api/client";
+import { downloadFile, getDownloadUrl } from "@/api/hermes/download";
 import { copyToClipboard } from "@/utils/clipboard";
 import MarkdownRenderer from "./MarkdownRenderer.vue";
 import { parseThinking, countThinkingChars } from "@/utils/thinking-parser";
 import { useChatStore } from "@/stores/hermes/chat";
+import { useProfilesStore } from "@/stores/hermes/profiles";
 import { useSettingsStore } from "@/stores/hermes/settings";
+import ProfileAvatar from "@/components/hermes/profiles/ProfileAvatar.vue";
 import {
   copyTextToClipboard,
   handleCodeBlockCopyClick,
@@ -32,11 +33,16 @@ const { t } = useI18n();
 const toast = useMessage();
 
 const isSystem = computed(() => props.message.role === "system");
+const isAgentError = computed(() => props.message.role === "assistant" && props.message.systemType === "error");
 
 const effectiveHeadingIdPrefix = computed(() => props.headingIdPrefix || `msg-${props.message.id}`);
 const isCommandMessage = computed(() => props.message.role === "command" || props.message.systemType === "command");
 const isCommandError = computed(() => props.message.role === "command" && props.message.systemType === "error");
-const isStatusCommand = computed(() => isCommandMessage.value && props.message.commandAction === "status");
+const isStatusCommand = computed(() =>
+  isCommandMessage.value
+  && props.message.commandAction === "status"
+  && props.message.commandData?.type !== "goal"
+);
 const statusItems = computed(() => {
   const data = props.message.commandData || {};
   return [
@@ -164,13 +170,6 @@ const contentFiles = computed<DisplayContentFile[] | null>(() => {
   });
 });
 
-// Generate download URL with auth token
-function getDownloadUrl(path: string, name: string): string {
-	const token = getApiKey();
-	const base = `/api/hermes/download?path=${encodeURIComponent(path)}&name=${encodeURIComponent(name)}`;
-	return token ? `${base}&token=${encodeURIComponent(token)}` : base;
-}
-
 function getContentFileUrl(file: DisplayContentFile): string {
   if (file.url) return file.url
   return file.path ? getDownloadUrl(file.path, file.name) : ''
@@ -180,9 +179,12 @@ const toolExpanded = ref(false);
 const previewUrl = ref<string | null>(null);
 
 const chatStore = useChatStore();
+const profilesStore = useProfilesStore();
 const settingsStore = useSettingsStore();
 const speech = useGlobalSpeech();
 const voiceSettings = useVoiceSettings();
+const assistantProfileName = computed(() => chatStore.activeSession?.profile || profilesStore.activeProfileName || "default");
+const assistantProfileAvatar = computed(() => profilesStore.profiles.find(profile => profile.name === assistantProfileName.value)?.avatar);
 
 // Copy entire bubble content
 const copyableContent = computed(() => {
@@ -625,13 +627,9 @@ function handleSpeechToggle() {
 
   // Web Speech API 模式
   if (voiceSettings.provider.value === 'webspeech') {
-    const text = speech.extractReadableText(content)
-    if (text) {
-      speech.stop(false)
-      speech.speakViaBrowser(props.message.id, text, {
-        voiceName: voiceSettings.webspeechVoice.value || undefined,
-      })
-    }
+    speech.toggleBrowser(props.message.id, content, {
+      voiceName: voiceSettings.webspeechVoice.value || undefined,
+    })
     return
   }
 
@@ -773,17 +771,19 @@ onBeforeUnmount(() => {
     </template>
     <template v-else>
       <div class="msg-body">
-        <img
+        <ProfileAvatar
           v-if="message.role === 'assistant'"
-          src="/logo.png"
-          alt="Hermes"
           class="msg-avatar"
+          :name="assistantProfileName"
+          :avatar="assistantProfileAvatar"
+          :size="40"
         />
         <div class="msg-content" :class="message.role">
           <div
             class="message-bubble"
             :class="{
               system: isSystem,
+              'agent-error': isAgentError,
               command: isCommandMessage,
               'command-error': isCommandError,
               'speech-playing': isPlayingThisMessage && !isPausedThisMessage,
@@ -995,6 +995,8 @@ onBeforeUnmount(() => {
   display: flex;
   flex-direction: column;
   position: relative;
+  min-width: 0;
+  max-width: 100%;
 
   &.user {
     align-items: flex-end;
@@ -1036,6 +1038,12 @@ onBeforeUnmount(() => {
     .message-bubble {
       background-color: $msg-assistant-bg;
       border-radius: 10px;
+    }
+
+    .message-bubble.agent-error {
+      color: $error;
+      background-color: rgba(var(--error-rgb), 0.06);
+      border: 1px solid rgba(var(--error-rgb), 0.2);
     }
   }
 
@@ -1112,6 +1120,20 @@ onBeforeUnmount(() => {
   &.command-error {
     border-color: rgba(var(--warning-rgb), 0.28);
     background-color: rgba(var(--warning-rgb), 0.06);
+  }
+
+  &.agent-error {
+    color: $error;
+    background-color: rgba(var(--error-rgb), 0.06);
+    border: 1px solid rgba(var(--error-rgb), 0.2);
+
+    :deep(.markdown-body),
+    :deep(.markdown-body p),
+    :deep(.markdown-body li),
+    :deep(.markdown-body strong),
+    :deep(.markdown-body code) {
+      color: $error;
+    }
   }
 
   &.speech-playing {
@@ -1429,6 +1451,9 @@ onBeforeUnmount(() => {
   color: $text-muted;
   padding: 2px 4px;
   border-radius: $radius-sm;
+  min-width: 0;
+  max-width: 100%;
+  box-sizing: border-box;
 
   &.expandable {
     cursor: pointer;
@@ -1440,14 +1465,21 @@ onBeforeUnmount(() => {
 
   .tool-name {
     font-family: $font-code;
-    flex-shrink: 0;
-  }
-
-  .tool-preview {
+    flex: 0 1 auto;
+    min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    max-width: 400px;
+  }
+
+  .tool-preview {
+    display: block;
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: min(400px, 100%);
   }
 }
 

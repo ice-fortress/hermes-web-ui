@@ -4,6 +4,7 @@ import { NButton, NTag, NSpin, useMessage, useDialog } from 'naive-ui'
 import type { HermesProfile, HermesProfileDetail } from '@/api/hermes/profiles'
 import { useProfilesStore } from '@/stores/hermes/profiles'
 import { useI18n } from 'vue-i18n'
+import ProfileAvatar from './ProfileAvatar.vue'
 
 const props = defineProps<{ profile: HermesProfile }>()
 const emit = defineEmits<{}>()
@@ -36,9 +37,19 @@ async function toggleDetail() {
 }
 
 async function handleSwitch() {
+  dialog.warning({
+    title: t('profiles.switchTo'),
+    content: t('profiles.switchConfirm', { name: props.profile.name }),
+    positiveText: t('profiles.switchTo'),
+    negativeText: t('common.cancel'),
+    onPositiveClick: performHermesSwitch,
+  })
+}
+
+async function performHermesSwitch() {
   switching.value = true
   try {
-    const ok = await profilesStore.switchProfile(props.profile.name)
+    const ok = await profilesStore.switchHermesProfile(props.profile.name)
     if (ok) {
       message.success(t('profiles.switchSuccess', { name: props.profile.name }))
       // Reload to refresh all profile-dependent data
@@ -86,7 +97,10 @@ async function handleExport() {
 <template>
   <div class="profile-card" :class="{ active: profile.active }">
     <div class="card-header">
-      <h3 class="profile-name">{{ profile.name }}</h3>
+      <div class="profile-title">
+        <ProfileAvatar :name="profile.name" :avatar="profile.avatar" :size="28" />
+        <h3 class="profile-name">{{ profile.name }}</h3>
+      </div>
       <NTag v-if="profile.active" size="tiny" type="success" :bordered="false">
         {{ t('profiles.active') }}
       </NTag>
@@ -188,7 +202,15 @@ async function handleExport() {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 10px;
   margin-bottom: 12px;
+}
+
+.profile-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
 }
 
 .profile-name {
@@ -198,7 +220,8 @@ async function handleExport() {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  max-width: 70%;
+  max-width: 100%;
+  margin: 0;
 }
 
 .card-body {

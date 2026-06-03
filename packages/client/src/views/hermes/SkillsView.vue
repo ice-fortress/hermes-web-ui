@@ -1,14 +1,17 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { NInput } from 'naive-ui'
 import { useI18n } from 'vue-i18n'
 import SkillList from '@/components/hermes/skills/SkillList.vue'
 import SkillDetail from '@/components/hermes/skills/SkillDetail.vue'
+import MarkdownRenderer from '@/components/hermes/chat/MarkdownRenderer.vue'
 import { fetchSkills, type SkillCategory, type SkillSource, type SkillInfo } from '@/api/hermes/skills'
+import { useProfilesStore } from '@/stores/hermes/profiles'
 
 type SourceFilter = SkillSource | 'modified'
 
-const { t } = useI18n()
+const { t, locale } = useI18n()
+const profilesStore = useProfilesStore()
 const categories = ref<SkillCategory[]>([])
 const archived = ref<SkillInfo[]>([])
 const loading = ref(false)
@@ -17,7 +20,15 @@ const selectedSkill = ref('')
 const searchQuery = ref('')
 const showSidebar = ref(true)
 const sourceFilter = ref<SourceFilter | null>(null)
+const recommendations = ref('')
 let mobileQuery: MediaQueryList | null = null
+let recommendationsRequestSeq = 0
+
+const recommendationsPath = computed(() => {
+  return String(locale.value).startsWith('zh')
+    ? '/skill-recommendations.zh.md'
+    : '/skill-recommendations.en.md'
+})
 
 const selectedSkillData = computed(() => {
   if (!selectedCategory.value || !selectedSkill.value) return null
@@ -37,6 +48,7 @@ onMounted(() => {
   handleMobileChange(mobileQuery)
   mobileQuery.addEventListener('change', handleMobileChange)
   loadSkills()
+  loadRecommendations()
 })
 
 onUnmounted(() => {
@@ -46,6 +58,9 @@ onUnmounted(() => {
 async function loadSkills() {
   loading.value = true
   try {
+    if (!profilesStore.activeProfileName || profilesStore.profiles.length === 0) {
+      await profilesStore.fetchProfiles()
+    }
     const data = await fetchSkills()
     categories.value = data.categories
     archived.value = data.archived
@@ -56,11 +71,38 @@ async function loadSkills() {
   }
 }
 
+async function loadRecommendations() {
+  const requestSeq = ++recommendationsRequestSeq
+  try {
+    const response = await fetch(recommendationsPath.value)
+    if (!response.ok) throw new Error(`HTTP ${response.status}`)
+    const text = await response.text()
+    if (/^\s*<!doctype html/i.test(text) || /^\s*<html[\s>]/i.test(text)) {
+      throw new Error('Skill recommendations file was not found')
+    }
+    if (requestSeq === recommendationsRequestSeq) {
+      recommendations.value = text
+    }
+  } catch (err) {
+    if (requestSeq === recommendationsRequestSeq) {
+      recommendations.value = ''
+    }
+    console.error('Failed to load skill recommendations:', err)
+  }
+}
+
+watch(recommendationsPath, loadRecommendations)
+
 function toggleFilter(filter: SourceFilter) {
   sourceFilter.value = sourceFilter.value === filter ? null : filter
 }
 
 function handleSelect(category: string, skill: string) {
+  if (selectedCategory.value === category && selectedSkill.value === skill) {
+    selectedCategory.value = ''
+    selectedSkill.value = ''
+    return
+  }
   selectedCategory.value = category
   selectedSkill.value = skill
   if (window.innerWidth <= 768) {
@@ -99,6 +141,9 @@ function handlePinToggled(name: string, pinned: boolean) {
         </button>
         <button class="legend-item" :class="{ active: sourceFilter === 'local' }" @click="toggleFilter('local')">
           <span class="legend-dot dot-local" />{{ t('skills.source.local') }}
+        </button>
+        <button class="legend-item" :class="{ active: sourceFilter === 'external' }" @click="toggleFilter('external')">
+          <span class="legend-dot dot-external" />{{ t('skills.source.external') }}
         </button>
         <button class="legend-item" :class="{ active: sourceFilter === 'modified' }" @click="toggleFilter('modified')">
           <span class="modified-icon">✎</span>{{ t('skills.modified') }}
@@ -139,13 +184,16 @@ function handlePinToggled(name: string, pinned: boolean) {
               :pinned="selectedSkillData?.pinned"
               @pin-toggled="handlePinToggled"
             />
-            <div v-else class="empty-detail">
-              <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1" opacity="0.2">
-                <polygon points="12 2 2 7 12 12 22 7 12 2" />
-                <polyline points="2 17 12 22 22 17" />
-                <polyline points="2 12 12 17 22 12" />
-              </svg>
-              <span>{{ t('skills.noMatch') }}</span>
+            <div v-else class="recommendations-panel">
+              <MarkdownRenderer v-if="recommendations" :content="recommendations" />
+              <div v-else class="empty-detail">
+                <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1" opacity="0.2">
+                  <polygon points="12 2 2 7 12 12 22 7 12 2" />
+                  <polyline points="2 17 12 22 22 17" />
+                  <polyline points="2 12 12 17 22 12" />
+                </svg>
+                <span>{{ t('skills.noMatch') }}</span>
+              </div>
             </div>
           </div>
         </div>
@@ -208,6 +256,7 @@ function handlePinToggled(name: string, pinned: boolean) {
 .legend-dot.dot-builtin { background: #888; }
 .legend-dot.dot-hub { background: #4a90d9; }
 .legend-dot.dot-local { background: #66bb6a; }
+.legend-dot.dot-external { background: #f59e0b; }
 
 .modified-icon {
   font-size: 11px;
@@ -324,5 +373,16 @@ function handlePinToggled(name: string, pinned: boolean) {
   gap: 12px;
   color: $text-muted;
   font-size: 13px;
+}
+
+.recommendations-panel {
+  max-width: 920px;
+  margin: 0 auto;
+  padding: 4px 0 40px;
+
+  :deep(.markdown-body) {
+    font-size: 14px;
+    line-height: 1.7;
+  }
 }
 </style>

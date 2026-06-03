@@ -2,7 +2,7 @@ import { request } from './client'
 
 export interface AuthStatus {
   hasPasswordLogin: boolean
-  username: string | null
+  hasUsers?: boolean
 }
 
 export async function fetchAuthStatus(): Promise<AuthStatus> {
@@ -25,6 +25,56 @@ export async function loginWithPassword(username: string, password: string): Pro
   }
   const data = await res.json()
   return data.token
+}
+
+export interface CurrentUser {
+  id: number
+  username: string
+  role: UserRole
+  status: UserStatus
+  created_at: number
+  updated_at: number
+  last_login_at: number | null
+  avatar?: string
+  requiresCredentialChange?: boolean
+}
+
+export interface UserAvatar {
+  type: 'image' | 'default'
+  dataUrl?: string
+  seed?: string
+}
+
+export async function fetchCurrentUser(): Promise<CurrentUser> {
+  const res = await request<{ user: CurrentUser }>('/api/auth/me')
+  return res.user
+}
+
+export async function fetchMyAvatar(): Promise<UserAvatar | null> {
+  const res = await request<{ avatar: string }>('/api/auth/avatar')
+  if (!res.avatar) return null
+  try {
+    const parsed = JSON.parse(res.avatar) as UserAvatar
+    if (parsed && (parsed.type === 'image' || parsed.type === 'default')) return parsed
+    return null
+  } catch {
+    return null
+  }
+}
+
+export async function updateMyAvatar(avatar: UserAvatar): Promise<void> {
+  const payload = JSON.stringify(avatar)
+  await request('/api/auth/avatar', {
+    method: 'PUT',
+    body: JSON.stringify({ avatar: payload }),
+  })
+}
+
+export async function resetMyAvatar(): Promise<void> {
+  await request('/api/auth/avatar', {
+    method: 'PUT',
+    body: JSON.stringify({ avatar: { type: 'default' } }),
+  })
 }
 
 export async function setupPassword(username: string, password: string): Promise<void> {
@@ -52,6 +102,70 @@ export async function removePassword(): Promise<void> {
   return request('/api/auth/password', {
     method: 'DELETE',
   })
+}
+
+export type UserRole = 'super_admin' | 'admin'
+export type UserStatus = 'active' | 'disabled'
+
+export interface ManagedUser {
+  id: number
+  username: string
+  role: UserRole
+  status: UserStatus
+  profiles: string[]
+  default_profile: string | null
+  created_at: number
+  updated_at: number
+  last_login_at: number | null
+}
+
+export interface ManagedUsersResponse {
+  users: ManagedUser[]
+  profiles: string[]
+}
+
+export async function fetchManagedUsers(): Promise<ManagedUsersResponse> {
+  return request<ManagedUsersResponse>('/api/auth/users')
+}
+
+export async function createManagedUser(input: {
+  username: string
+  password: string
+  role: UserRole
+  status: UserStatus
+  profiles: string[]
+  defaultProfile?: string | null
+}): Promise<ManagedUsersResponse> {
+  const res = await request<{ users: ManagedUser[] }>('/api/auth/users', {
+    method: 'POST',
+    body: JSON.stringify(input),
+  })
+  const current = await fetchManagedUsers()
+  return { ...current, users: res.users }
+}
+
+export async function updateManagedUser(id: number, input: {
+  username?: string
+  password?: string
+  role?: UserRole
+  status?: UserStatus
+  profiles?: string[]
+  defaultProfile?: string | null
+}): Promise<ManagedUsersResponse> {
+  const res = await request<{ users: ManagedUser[] }>(`/api/auth/users/${id}`, {
+    method: 'PUT',
+    body: JSON.stringify(input),
+  })
+  const current = await fetchManagedUsers()
+  return { ...current, users: res.users }
+}
+
+export async function deleteManagedUser(id: number): Promise<ManagedUsersResponse> {
+  const res = await request<{ users: ManagedUser[] }>(`/api/auth/users/${id}`, {
+    method: 'DELETE',
+  })
+  const current = await fetchManagedUsers()
+  return { ...current, users: res.users }
 }
 
 export interface LockedIp {

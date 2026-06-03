@@ -71,7 +71,7 @@ describe('getModelContextLength', () => {
 
     const { getModelContextLength } = await loadModelContext()
 
-    expect(getModelContextLength()).toBe(200_000)
+    expect(getModelContextLength()).toBe(256_000)
   })
 
   it('does not scan other providers when the configured provider exists without that model', async () => {
@@ -79,7 +79,7 @@ describe('getModelContextLength', () => {
     writeModelsCache({
       'openai-codex': {
         models: {
-          'gpt-5.4': { limit: { context: 200_000 } },
+          'gpt-5.4': { limit: { context: 256_000 } },
         },
       },
       openai: {
@@ -91,7 +91,7 @@ describe('getModelContextLength', () => {
 
     const { getModelContextLength } = await loadModelContext()
 
-    expect(getModelContextLength()).toBe(200_000)
+    expect(getModelContextLength()).toBe(256_000)
   })
 
   it('uses the configured provider cache entry when the provider matches', async () => {
@@ -107,6 +107,22 @@ describe('getModelContextLength', () => {
     const { getModelContextLength } = await loadModelContext()
 
     expect(getModelContextLength()).toBe(1_050_000)
+  })
+
+  it('prefers requested provider model context_length over top-level default context_length', async () => {
+    writeConfig(`model:\n  default: gpt-5.5\n  provider: openai-codex\n  context_length: 272000\n\nproviders:\n  qwen:\n    name: Qwen\n    default_model: qwen3.6-plus\n    models:\n      qwen3.6-plus:\n        context_length: 1048576\n`)
+
+    const { getModelContextLength } = await loadModelContext()
+
+    expect(getModelContextLength({ provider: 'qwen', model: 'qwen3.6-plus' })).toBe(1_048_576)
+  })
+
+  it('uses provider-level context_length when the requested model belongs to that provider', async () => {
+    writeConfig(`model:\n  default: gpt-5.5\n  provider: openai-codex\n  context_length: 272000\n\nproviders:\n  qwen:\n    name: Qwen\n    default_model: qwen3.6-plus\n    models:\n      - qwen3.6-plus\n    context_length: 1048576\n`)
+
+    const { getModelContextLength } = await loadModelContext()
+
+    expect(getModelContextLength({ provider: 'qwen', model: 'qwen3.6-plus' })).toBe(1_048_576)
   })
 
   it('keeps legacy model-name cache lookup when no provider is configured', async () => {
@@ -241,7 +257,7 @@ describe('getModelContextLength', () => {
 
     const { getModelContextLength } = await loadModelContext()
 
-    expect(getModelContextLength()).toBe(200_000)
+    expect(getModelContextLength()).toBe(256_000)
   })
 
   it('does not trust custom:name alone when the matched custom provider entry points at an unknown proxy url', async () => {
@@ -256,7 +272,7 @@ describe('getModelContextLength', () => {
 
     const { getModelContextLength } = await loadModelContext()
 
-    expect(getModelContextLength()).toBe(200_000)
+    expect(getModelContextLength()).toBe(256_000)
   })
 
   it('does not fall through to a unique global match after a resolved custom:name provider misses in its scoped cache provider', async () => {
@@ -276,7 +292,7 @@ describe('getModelContextLength', () => {
 
     const { getModelContextLength } = await loadModelContext()
 
-    expect(getModelContextLength()).toBe(200_000)
+    expect(getModelContextLength()).toBe(256_000)
   })
 
   it('allows a unique global model-name fallback for unresolved custom providers', async () => {
@@ -321,7 +337,7 @@ describe('getModelContextLength', () => {
 
     const { getModelContextLength } = await loadModelContext()
 
-    expect(getModelContextLength()).toBe(200_000)
+    expect(getModelContextLength()).toBe(256_000)
   })
 
   it('does not guess across multiple cache providers when a custom provider remains unresolved', async () => {
@@ -341,6 +357,6 @@ describe('getModelContextLength', () => {
 
     const { getModelContextLength } = await loadModelContext()
 
-    expect(getModelContextLength()).toBe(200_000)
+    expect(getModelContextLength()).toBe(256_000)
   })
 })

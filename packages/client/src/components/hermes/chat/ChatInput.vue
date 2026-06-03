@@ -11,9 +11,13 @@ import { useI18n } from 'vue-i18n'
 import { useToolTraceVisibility } from '@/composables/useToolTraceVisibility'
 
 const chatStore = useChatStore()
+const appStore = useAppStore()
+const profilesStore = useProfilesStore()
 const { t } = useI18n()
 const message = useMessage()
 const { toolTraceVisible, toggleToolTraceVisible } = useToolTraceVisibility()
+const DRAFT_STORAGE_KEY = 'hermes_chat_input_drafts_v1'
+type DraftMap = Record<string, string>
 const inputText = ref('')
 const textareaRef = ref<HTMLTextAreaElement>()
 const commandDropdownRef = ref<HTMLDivElement>()
@@ -28,12 +32,21 @@ const bridgeCommands = computed(() => [
   { name: 'status', args: '', description: t('chat.slashCommands.status') },
   { name: 'abort', args: '', description: t('chat.slashCommands.abort') },
   { name: 'queue', args: t('chat.slashCommandArgs.message'), description: t('chat.slashCommands.queue') },
+  { name: 'plan', args: t('chat.slashCommandArgs.text'), description: t('chat.slashCommands.plan') },
+  { name: 'goal', args: t('chat.slashCommandArgs.text'), description: t('chat.slashCommands.goal') },
+  { name: 'goal', args: 'status', insertText: 'goal status', description: t('chat.slashCommands.goalStatus') },
+  { name: 'goal', args: 'pause', insertText: 'goal pause', description: t('chat.slashCommands.goalPause') },
+  { name: 'goal', args: 'resume', insertText: 'goal resume', description: t('chat.slashCommands.goalResume') },
+  { name: 'goal', args: 'done', insertText: 'goal done', description: t('chat.slashCommands.goalDone') },
+  { name: 'goal', args: 'clear', insertText: 'goal clear', description: t('chat.slashCommands.goalClear') },
+  { name: 'subgoal', args: t('chat.slashCommandArgs.text'), description: t('chat.slashCommands.subgoal') },
   { name: 'clear', args: '', description: t('chat.slashCommands.clear') },
   { name: 'clear', args: '--history', insertText: 'clear --history', description: t('chat.slashCommands.clearHistory') },
   { name: 'title', args: t('chat.slashCommandArgs.title'), description: t('chat.slashCommands.title') },
   { name: 'compress', args: '', description: t('chat.slashCommands.compress') },
   { name: 'steer', args: t('chat.slashCommandArgs.text'), description: t('chat.slashCommands.steer') },
   { name: 'destroy', args: '', description: t('chat.slashCommands.destroy') },
+  { name: 'reload-mcp', args: '', description: t('chat.slashCommands.reloadMcp') },
 ])
 
 const slashActive = ref(false)
@@ -81,8 +94,43 @@ function startResize(e: MouseEvent) {
 // 自动播放语音开关
 const autoPlaySpeech = ref(false)
 
+function readDraftMap(): DraftMap {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(DRAFT_STORAGE_KEY) || '{}')
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {}
+  } catch {
+    return {}
+  }
+}
+
+function getActiveDraftSessionId() {
+  return chatStore.activeSessionId || chatStore.activeSession?.id || ''
+}
+
+function loadDraftForActiveSession() {
+  const sessionId = getActiveDraftSessionId()
+  inputText.value = sessionId ? readDraftMap()[sessionId] || '' : ''
+}
+
+function saveDraftForActiveSession(value: string) {
+  const sessionId = getActiveDraftSessionId()
+  if (!sessionId) return
+  const drafts = readDraftMap()
+  if (value) {
+    drafts[sessionId] = value
+  } else {
+    delete drafts[sessionId]
+  }
+  if (Object.keys(drafts).length > 0) {
+    localStorage.setItem(DRAFT_STORAGE_KEY, JSON.stringify(drafts))
+  } else {
+    localStorage.removeItem(DRAFT_STORAGE_KEY)
+  }
+}
+
 // 从 localStorage 读取设置
 onMounted(() => {
+  loadDraftForActiveSession()
   const saved = localStorage.getItem('autoPlaySpeech')
   if (saved !== null) {
     autoPlaySpeech.value = saved === 'true'
@@ -96,6 +144,14 @@ watch(autoPlaySpeech, (value) => {
   localStorage.setItem('autoPlaySpeech', String(value))
   // 通知 chat store
   chatStore.setAutoPlaySpeech(value)
+})
+
+watch(inputText, (value) => {
+  saveDraftForActiveSession(value)
+})
+
+watch(() => chatStore.activeSession?.id, () => {
+  loadDraftForActiveSession()
 })
 
 const canSend = computed(() => inputText.value.trim() || attachments.value.length > 0)
@@ -140,12 +196,15 @@ function selectBridgeCommand(command: { name: string; args: string; insertText?:
 
 // --- Context info ---
 
-const contextLength = ref(200000)
-const FALLBACK_CONTEXT = 200000
+const contextLength = ref(256000)
+const FALLBACK_CONTEXT = 256000
+let contextLengthLoadedKey = ''
+let contextLengthRequestKey = ''
+let contextLengthRequest: Promise<void> | null = null
 
 // Context length editing
 const showContextEditModal = ref(false)
-const editingContextLimit = ref(200000)
+const editingContextLimit = ref(256000)
 const isSavingContextLimit = ref(false)
 
 async function handleEditContextLimit() {
@@ -161,8 +220,8 @@ async function saveContextLimit() {
 
   isSavingContextLimit.value = true
   try {
-    const provider = chatStore.activeSession?.provider || useAppStore().selectedProvider || ''
-    const model = chatStore.activeSession?.model || useAppStore().selectedModel || ''
+    const provider = chatStore.activeSession?.provider || appStore.selectedProvider || ''
+    const model = chatStore.activeSession?.model || appStore.selectedModel || ''
 
     if (!provider || !model) {
       message.error(t('chat.contextEditFailed'))
@@ -171,6 +230,7 @@ async function saveContextLimit() {
 
     await setModelContext(provider, model, editingContextLimit.value)
     contextLength.value = editingContextLimit.value
+    contextLengthLoadedKey = currentContextLengthKey()
     showContextEditModal.value = false
     message.success(t('chat.contextEditSuccess'))
   } catch (err: any) {
@@ -180,30 +240,65 @@ async function saveContextLimit() {
   }
 }
 
-async function loadContextLength() {
-  try {
-    const activeSession = chatStore.activeSession
-    const profile = activeSession?.profile || useProfilesStore().activeProfileName || undefined
-    contextLength.value = await fetchContextLength(
-      profile,
-      activeSession?.provider || undefined,
-      activeSession?.model || undefined,
-    )
-  } catch {
-    contextLength.value = FALLBACK_CONTEXT
+function currentContextLengthParams() {
+  const activeSession = chatStore.activeSession
+  return {
+    profile: activeSession?.profile || profilesStore.activeProfileName || undefined,
+    provider: activeSession?.provider || undefined,
+    model: activeSession?.model || undefined,
   }
 }
 
+function currentContextLengthKey() {
+  const params = currentContextLengthParams()
+  return `${params.profile || ''}|${params.provider || ''}|${params.model || ''}`
+}
+
+async function loadContextLength() {
+  const key = currentContextLengthKey()
+  if (key === contextLengthLoadedKey) return
+  if (key === contextLengthRequestKey && contextLengthRequest) return contextLengthRequest
+
+  contextLengthRequestKey = key
+  contextLengthRequest = (async () => {
+    const params = currentContextLengthParams()
+    try {
+      const value = await fetchContextLength(params.profile, params.provider, params.model)
+      if (currentContextLengthKey() !== key) return
+      contextLength.value = value
+      contextLengthLoadedKey = key
+    } catch {
+      if (currentContextLengthKey() !== key) return
+      contextLength.value = FALLBACK_CONTEXT
+      contextLengthLoadedKey = key
+    } finally {
+      if (contextLengthRequestKey === key) {
+        contextLengthRequest = null
+        contextLengthRequestKey = ''
+      }
+    }
+  })()
+  return contextLengthRequest
+}
+
 onMounted(loadContextLength)
-watch(() => useProfilesStore().activeProfileName, loadContextLength)
-watch(() => useAppStore().selectedProvider, loadContextLength)
-watch(() => useAppStore().selectedModel, loadContextLength)
-watch(() => chatStore.activeSession?.id, loadContextLength)
-watch(() => chatStore.activeSession?.profile, loadContextLength)
-watch(() => chatStore.activeSession?.provider, loadContextLength)
-watch(() => chatStore.activeSession?.model, loadContextLength)
+watch(
+  () => [
+    profilesStore.activeProfileName,
+    appStore.selectedProvider,
+    appStore.selectedModel,
+    chatStore.activeSession?.id,
+    chatStore.activeSession?.profile,
+    chatStore.activeSession?.provider,
+    chatStore.activeSession?.model,
+  ],
+  loadContextLength,
+  { flush: 'post' },
+)
 
 const totalTokens = computed(() => {
+  const context = chatStore.activeSession?.contextTokens
+  if (typeof context === 'number' && Number.isFinite(context) && context > 0) return context
   const input = chatStore.activeSession?.inputTokens ?? 0
   const output = chatStore.activeSession?.outputTokens ?? 0
   return input + output
@@ -304,6 +399,7 @@ function handleSend() {
 
   chatStore.sendMessage(text, attachments.value.length > 0 ? attachments.value : undefined)
   inputText.value = ''
+  saveDraftForActiveSession('')
   attachments.value = []
   slashActive.value = false
 
@@ -874,6 +970,10 @@ function isImage(type: string): boolean {
   max-height: 400px;
   min-height: 20px;
   overflow-y: auto;
+
+  @media (max-width: 768px) {
+    font-size: 16px;
+  }
 
   &::placeholder {
     color: $text-muted;

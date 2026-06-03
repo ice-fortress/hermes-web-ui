@@ -1,6 +1,6 @@
 import { execFileSync, spawn, type ChildProcess } from 'child_process'
 import { existsSync, readFileSync } from 'fs'
-import { createServer } from 'net'
+import { createConnection, createServer } from 'net'
 import { dirname, isAbsolute, join, resolve } from 'path'
 import { logger } from '../../logger'
 import { detectHermesHome, getHermesBin } from '../hermes-path'
@@ -9,6 +9,11 @@ import { DEFAULT_AGENT_BRIDGE_ENDPOINT } from './client'
 const DEFAULT_AGENT_BRIDGE_STARTUP_TIMEOUT_MS = 120000
 const DEFAULT_AGENT_BRIDGE_RESTART_DELAY_MS = 1000
 const MAX_AGENT_BRIDGE_RESTART_DELAY_MS = 30000
+const OPENROUTER_WEB_UI_ATTRIBUTION_ENV = {
+  HERMES_OPENROUTER_APP_REFERER: 'https://hermes-studio.ai',
+  HERMES_OPENROUTER_APP_TITLE: 'Hermes Web UI',
+  HERMES_OPENROUTER_APP_CATEGORIES: 'cli-agent,personal-agent',
+} as const
 
 export interface AgentBridgeManagerOptions {
   endpoint?: string
@@ -25,11 +30,34 @@ export interface BridgeCommand {
   hermesHome: string
 }
 
+export interface AgentBridgeManagerRuntimeState {
+  endpoint: string
+  running: boolean
+  ready: boolean
+  pid?: number
+  starting: boolean
+  stopping: boolean
+  restartScheduled: boolean
+  restartAttempts: number
+}
+
 function envPositiveInt(name: string): number | undefined {
   const raw = process.env[name]
   if (!raw) return undefined
   const value = Number(raw)
   return Number.isFinite(value) && value > 0 ? value : undefined
+}
+
+export function buildAgentBridgeProcessEnv(endpoint: string, hermesHome: string | undefined, agentRoot: string | undefined): NodeJS.ProcessEnv {
+  return {
+    ...process.env,
+    HERMES_AGENT_BRIDGE_ENDPOINT: endpoint,
+    HERMES_HOME: hermesHome,
+    HERMES_OPENROUTER_APP_REFERER: process.env.HERMES_OPENROUTER_APP_REFERER || OPENROUTER_WEB_UI_ATTRIBUTION_ENV.HERMES_OPENROUTER_APP_REFERER,
+    HERMES_OPENROUTER_APP_TITLE: process.env.HERMES_OPENROUTER_APP_TITLE || OPENROUTER_WEB_UI_ATTRIBUTION_ENV.HERMES_OPENROUTER_APP_TITLE,
+    HERMES_OPENROUTER_APP_CATEGORIES: process.env.HERMES_OPENROUTER_APP_CATEGORIES || OPENROUTER_WEB_UI_ATTRIBUTION_ENV.HERMES_OPENROUTER_APP_CATEGORIES,
+    ...(agentRoot ? { HERMES_AGENT_ROOT: agentRoot } : {}),
+  }
 }
 
 function pathCandidates(agentRoot?: string): string[] {
@@ -99,6 +127,7 @@ function agentRootFromHermesBin(): string | undefined {
     resolve(binDir, '..'),
     resolve(binDir, '..', '..'),
     resolve(binDir, '..', 'hermes-agent'),
+    resolve(binDir, '..', 'lib', 'hermes-agent'),
     resolve(binDir, '..', '..', 'hermes-agent'),
   ]
   const root = rootCandidates.find(candidate => existsSync(join(candidate, 'run_agent.py')))
@@ -113,6 +142,7 @@ function agentRootFromHermesBin(): string | undefined {
       const shebangRootCandidates = [
         resolve(pyDir, '..', '..'),
         resolve(pyDir, '..', '..', 'hermes-agent'),
+        resolve(pyDir, '..', '..', 'lib', 'hermes-agent'),
       ]
       return shebangRootCandidates.find(candidate => existsSync(join(candidate, 'run_agent.py')))
     }
@@ -155,6 +185,10 @@ function resolveAgentRoot(explicit?: string, hermesHome = detectHermesHome()): s
     agentRootFromHermesBin(),
     process.cwd(),
     join(process.cwd(), 'hermes-agent'),
+    '/usr/local/lib/hermes-agent',
+    '/usr/local/hermes-agent',
+    '/opt/hermes/hermes-agent',
+    '/opt/hermes-agent',
   ].filter((value): value is string => !!value && value.trim().length > 0)
   return candidates.find(candidate => existsSync(join(candidate, 'run_agent.py')))
 }
@@ -211,6 +245,10 @@ function isTcpEndpoint(endpoint: string): boolean {
   return endpoint.startsWith('tcp://')
 }
 
+function isDesktopRuntime(): boolean {
+  return String(process.env.HERMES_DESKTOP || '').trim().toLowerCase() === 'true'
+}
+
 async function canListenTcpEndpoint(endpoint: string): Promise<boolean> {
   const url = new URL(endpoint)
   const host = url.hostname || '127.0.0.1'
@@ -230,6 +268,26 @@ async function canListenTcpEndpoint(endpoint: string): Promise<boolean> {
   })
 }
 
+async function canConnectTcpEndpoint(endpoint: string): Promise<boolean> {
+  const url = new URL(endpoint)
+  const host = url.hostname || '127.0.0.1'
+  const port = Number(url.port)
+  if (!Number.isFinite(port) || port <= 0) return false
+
+  return await new Promise<boolean>((resolveConnected) => {
+    const socket = createConnection({ port, host })
+    const done = (connected: boolean) => {
+      socket.removeAllListeners()
+      socket.destroy()
+      resolveConnected(connected)
+    }
+    socket.setTimeout(250)
+    socket.once('connect', () => done(true))
+    socket.once('timeout', () => done(false))
+    socket.once('error', () => done(false))
+  })
+}
+
 function tcpEndpointPort(endpoint: string): number | undefined {
   if (!isTcpEndpoint(endpoint)) return undefined
   const url = new URL(endpoint)
@@ -239,7 +297,7 @@ function tcpEndpointPort(endpoint: string): number | undefined {
 
 function windowsListeningPidsOnPort(port: number): number[] {
   try {
-    const output = execFileSync('netstat.exe', ['-ano', '-p', 'tcp'], { encoding: 'utf-8', windowsHide: true })
+    const output = execFileSync('netstat.exe', ['-ano', '-p', 'tcp'], { windowsHide: true }).toString('utf8')
     const pids = new Set<number>()
     for (const line of output.split(/\r?\n/)) {
       const parts = line.trim().split(/\s+/)
@@ -302,6 +360,19 @@ export class AgentBridgeManager {
     return !!this.child && !this.child.killed && this.ready
   }
 
+  getRuntimeState(): AgentBridgeManagerRuntimeState {
+    return {
+      endpoint: this.endpoint,
+      running: this.running,
+      ready: this.ready,
+      pid: this.child?.pid,
+      starting: !!this.starting,
+      stopping: this.stopping,
+      restartScheduled: !!this.restartTimer,
+      restartAttempts: this.restartAttempts,
+    }
+  }
+
   async start(): Promise<void> {
     if (this.running) return
     if (this.starting) return this.starting
@@ -328,12 +399,7 @@ export class AgentBridgeManager {
     if (agentRoot) args.push('--agent-root', agentRoot)
     if (hermesHome) args.push('--hermes-home', hermesHome)
 
-    const env = {
-      ...process.env,
-      HERMES_AGENT_BRIDGE_ENDPOINT: this.endpoint,
-      HERMES_HOME: hermesHome,
-      ...(agentRoot ? { HERMES_AGENT_ROOT: agentRoot } : {}),
-    }
+    const env = buildAgentBridgeProcessEnv(this.endpoint, hermesHome, agentRoot)
 
     logger.info('[agent-bridge] starting: %s %s', command.command, args.join(' '))
     const child = spawn(command.command, args, {
@@ -374,6 +440,16 @@ export class AgentBridgeManager {
         child.off('error', onError)
       }
 
+      const markReady = () => {
+        if (readyResolved) return
+        this.ready = true
+        this.restartAttempts = 0
+        readyResolved = true
+        cleanup()
+        child.stdout?.off('data', onStdout)
+        resolveReady()
+      }
+
       const onError = (err: Error) => {
         cleanup()
         child.stdout?.off('data', onStdout)
@@ -401,11 +477,7 @@ export class AgentBridgeManager {
             try {
               const parsed = JSON.parse(line)
               if (parsed?.event === 'ready') {
-                this.ready = true
-                this.restartAttempts = 0
-                readyResolved = true
-                cleanup()
-                resolveReady()
+                markReady()
                 return
               }
             } catch {}
@@ -416,6 +488,19 @@ export class AgentBridgeManager {
       child.once('error', onError)
       child.once('exit', onExitBeforeReady)
       child.stdout?.on('data', onStdout)
+
+      if (isDesktopRuntime() && isTcpEndpoint(this.endpoint)) {
+        const probe = async () => {
+          while (!readyResolved && !child.killed) {
+            if (await canConnectTcpEndpoint(this.endpoint)) {
+              markReady()
+              return
+            }
+            await new Promise(resolve => setTimeout(resolve, 100))
+          }
+        }
+        probe().catch(onError)
+      }
     })
 
     logger.info('[agent-bridge] ready at %s', this.endpoint)

@@ -4,6 +4,20 @@ import { tmpdir } from 'os'
 import { join } from 'path'
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 
+const agentBridgeMocks = vi.hoisted(() => ({
+  destroyAll: vi.fn(),
+  destroyProfile: vi.fn(),
+}))
+
+const skillInjectorMocks = vi.hoisted(() => ({
+  injectMissingSkills: vi.fn(),
+  resolveTargetDirForProfile: vi.fn(),
+}))
+
+const sessionDeleterMocks = vi.hoisted(() => ({
+  switchProfile: vi.fn(),
+}))
+
 // Mock hermes-cli
 vi.mock('../../packages/server/src/services/hermes/hermes-cli', () => ({
   listProfiles: vi.fn(),
@@ -20,19 +34,46 @@ vi.mock('../../packages/server/src/services/hermes/hermes-cli', () => ({
   importProfile: vi.fn(),
 }))
 
+vi.mock('../../packages/server/src/services/hermes/agent-bridge', () => ({
+  AgentBridgeClient: vi.fn(() => ({
+    destroyAll: agentBridgeMocks.destroyAll,
+    destroyProfile: agentBridgeMocks.destroyProfile,
+  })),
+}))
+
+vi.mock('../../packages/server/src/services/hermes/skill-injector', () => {
+  const HermesSkillInjector = vi.fn(() => ({
+    injectMissingSkills: skillInjectorMocks.injectMissingSkills,
+  })) as any
+  HermesSkillInjector.resolveTargetDirForProfile = skillInjectorMocks.resolveTargetDirForProfile
+  return { HermesSkillInjector }
+})
+
+vi.mock('../../packages/server/src/services/hermes/session-deleter', () => ({
+  SessionDeleter: {
+    getInstance: vi.fn(() => sessionDeleterMocks),
+  },
+}))
+
 import * as hermesCli from '../../packages/server/src/services/hermes/hermes-cli'
 
 describe('Profile Routes', () => {
   const originalHermesHome = process.env.HERMES_HOME
+  const originalWebUiHome = process.env.HERMES_WEB_UI_HOME
   const tempHomes: string[] = []
 
   beforeEach(() => {
     vi.clearAllMocks()
+    agentBridgeMocks.destroyProfile.mockResolvedValue({ destroyed: 0 })
+    skillInjectorMocks.injectMissingSkills.mockResolvedValue({ targets: [] })
+    skillInjectorMocks.resolveTargetDirForProfile.mockImplementation((name: string) => join('/tmp/hermes-skills', name))
   })
 
   afterEach(async () => {
     if (originalHermesHome === undefined) delete process.env.HERMES_HOME
     else process.env.HERMES_HOME = originalHermesHome
+    if (originalWebUiHome === undefined) delete process.env.HERMES_WEB_UI_HOME
+    else process.env.HERMES_WEB_UI_HOME = originalWebUiHome
     await Promise.all(tempHomes.splice(0).map(dir => rm(dir, { recursive: true, force: true })))
   })
 
@@ -115,6 +156,108 @@ describe('Profile Routes', () => {
       expect(ctx.status).toBe(500)
       expect(ctx.body).toEqual({ error: 'Failed to delete profile' })
       expect(existsSync(profileDir)).toBe(true)
+    })
+  })
+
+  describe('Hermes CLI active profile switch', () => {
+    it('only destroys bridge sessions for the target profile', async () => {
+      const hermesHome = await mkdtemp(join(tmpdir(), 'hermes-profile-switch-'))
+      tempHomes.push(hermesHome)
+      process.env.HERMES_HOME = hermesHome
+      const profileDir = join(hermesHome, 'profiles', 'work')
+      await mkdir(profileDir, { recursive: true })
+      await writeFile(join(profileDir, 'config.yaml'), 'model:\n  default: gpt-test\n', 'utf-8')
+      await writeFile(join(hermesHome, 'active_profile'), 'work\n', 'utf-8')
+      vi.mocked(hermesCli.useProfile).mockResolvedValue('Switched to work')
+      vi.mocked(hermesCli.getProfile).mockResolvedValue({
+        name: 'work',
+        path: profileDir,
+        model: 'gpt-test',
+        provider: 'test',
+        skills: 0,
+        hasEnv: false,
+        hasSoulMd: false,
+      } as any)
+      agentBridgeMocks.destroyProfile.mockResolvedValue({ destroyed: 2 })
+      const { switchProfile } = await import('../../packages/server/src/controllers/hermes/profiles')
+      const ctx: any = {
+        request: { body: { name: 'work' } },
+        status: 200,
+        body: undefined,
+      }
+
+      await switchProfile(ctx)
+
+      expect(ctx.status).toBe(200)
+      expect(ctx.body).toMatchObject({ success: true, active: 'work' })
+      expect(agentBridgeMocks.destroyProfile).toHaveBeenCalledWith('work')
+      expect(agentBridgeMocks.destroyAll).not.toHaveBeenCalled()
+      expect(sessionDeleterMocks.switchProfile).toHaveBeenCalledWith('work')
+    })
+  })
+
+  describe('profile avatars', () => {
+    it('stores generated avatar metadata under the Web UI home', async () => {
+      const webUiHome = await mkdtemp(join(tmpdir(), 'hermes-web-ui-avatar-'))
+      tempHomes.push(webUiHome)
+      process.env.HERMES_WEB_UI_HOME = webUiHome
+      const { updateAvatar } = await import('../../packages/server/src/controllers/hermes/profiles')
+      const ctx: any = {
+        params: { name: 'work' },
+        request: { body: { type: 'generated', seed: 'custom-seed' } },
+        status: 200,
+        body: undefined,
+      }
+
+      await updateAvatar(ctx)
+
+      const metaPath = join(webUiHome, 'profile-metadata', Buffer.from('work', 'utf-8').toString('base64url'), 'avatar.json')
+      expect(ctx.status).toBe(200)
+      expect(ctx.body.avatar).toMatchObject({ type: 'generated', seed: 'custom-seed' })
+      expect(JSON.parse(readFileSync(metaPath, 'utf-8'))).toMatchObject({
+        type: 'generated',
+        seed: 'custom-seed',
+      })
+    })
+
+    it('stores uploaded image avatars and returns a data URL', async () => {
+      const webUiHome = await mkdtemp(join(tmpdir(), 'hermes-web-ui-avatar-'))
+      tempHomes.push(webUiHome)
+      process.env.HERMES_WEB_UI_HOME = webUiHome
+      const dataUrl = `data:image/png;base64,${Buffer.from('avatar-png').toString('base64')}`
+      const { updateAvatar } = await import('../../packages/server/src/controllers/hermes/profiles')
+      const ctx: any = {
+        params: { name: 'work' },
+        request: { body: { type: 'image', dataUrl } },
+        status: 200,
+        body: undefined,
+      }
+
+      await updateAvatar(ctx)
+
+      const dir = join(webUiHome, 'profile-metadata', Buffer.from('work', 'utf-8').toString('base64url'))
+      const meta = JSON.parse(readFileSync(join(dir, 'avatar.json'), 'utf-8'))
+      expect(ctx.status).toBe(200)
+      expect(ctx.body.avatar).toMatchObject({ type: 'image', dataUrl })
+      expect(meta).toMatchObject({ type: 'image', file: 'avatar.bin', mime: 'image/png' })
+      expect(readFileSync(join(dir, 'avatar.bin')).toString()).toBe('avatar-png')
+    })
+
+    it('deletes profile avatar metadata', async () => {
+      const webUiHome = await mkdtemp(join(tmpdir(), 'hermes-web-ui-avatar-'))
+      tempHomes.push(webUiHome)
+      process.env.HERMES_WEB_UI_HOME = webUiHome
+      const metadataDir = join(webUiHome, 'profile-metadata', Buffer.from('work', 'utf-8').toString('base64url'))
+      await mkdir(metadataDir, { recursive: true })
+      await writeFile(join(metadataDir, 'avatar.json'), '{"type":"generated"}\n', 'utf-8')
+      const { deleteAvatar } = await import('../../packages/server/src/controllers/hermes/profiles')
+      const ctx: any = { params: { name: 'work' }, status: 200, body: undefined }
+
+      await deleteAvatar(ctx)
+
+      expect(ctx.status).toBe(200)
+      expect(ctx.body).toEqual({ success: true })
+      expect(existsSync(metadataDir)).toBe(false)
     })
   })
 })

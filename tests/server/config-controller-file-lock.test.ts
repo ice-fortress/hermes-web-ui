@@ -5,15 +5,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import YAML from 'js-yaml'
 
 const { mockRestartGateway, mockDestroyProfile } = vi.hoisted(() => ({
-  mockRestartGateway: vi.fn().mockResolvedValue('restarted'),
+  mockRestartGateway: vi.fn().mockResolvedValue({ running: true, profile: 'default' }),
   mockDestroyProfile: vi.fn().mockResolvedValue({ destroyed: true }),
 }))
 
-vi.mock('../../packages/server/src/services/hermes/hermes-cli', async (importOriginal) => {
-  const original = await importOriginal<any>()
+vi.mock('../../packages/server/src/services/hermes/gateway-autostart', () => {
   return {
-    ...original,
-    restartGateway: mockRestartGateway,
+    restartGatewayForProfile: mockRestartGateway,
   }
 })
 
@@ -33,8 +31,15 @@ async function loadController() {
   return import('../../packages/server/src/controllers/hermes/config')
 }
 
-function makeCtx(body: unknown): any {
-  return { request: { body }, query: {}, status: 200, body: undefined }
+function makeCtx(body: unknown, profile?: string): any {
+  return {
+    request: { body },
+    query: {},
+    state: profile ? { profile: { name: profile } } : {},
+    get: vi.fn(() => ''),
+    status: 200,
+    body: undefined,
+  }
 }
 
 beforeEach(async () => {
@@ -69,8 +74,8 @@ describe('config controller locked file updates', () => {
     await updateConfig(ctx)
 
     expect(ctx.body).toEqual({ success: true })
-    expect(mockRestartGateway).toHaveBeenCalledTimes(1)
-    expect(mockDestroyProfile).toHaveBeenCalledWith('default')
+    expect(mockRestartGateway).toHaveBeenCalledWith('default')
+    expect(mockDestroyProfile).not.toHaveBeenCalled()
     const config = YAML.load(await readFile(join(hermesHome, 'config.yaml'), 'utf-8')) as any
     expect(config.telegram.enabled).toBe(true)
     expect(config.telegram.extra).toEqual({ mode: 'old', token_mode: 'env' })
@@ -147,5 +152,161 @@ describe('config controller locked file updates', () => {
     expect(ctx.body.platforms.qqbot.extra.markdown_support).toBe(true)
     expect(ctx.body.platforms.qqbot.allowed_users).toBe('user-1,user-2')
     expect(ctx.body.platforms.qqbot.allow_all_users).toBe(false)
+  })
+
+  it('reads and writes channel settings in the request-scoped profile only', async () => {
+    const researchDir = join(hermesHome, 'profiles', 'research')
+    await mkdir(researchDir, { recursive: true })
+    await writeFile(join(hermesHome, 'config.yaml'), [
+      'telegram:',
+      '  require_mention: false',
+      'model:',
+      '  default: keep-default-model',
+      '',
+    ].join('\n'), 'utf-8')
+    await writeFile(join(hermesHome, '.env'), [
+      'TELEGRAM_BOT_TOKEN=keep-default-token',
+      '',
+    ].join('\n'), 'utf-8')
+    await writeFile(join(researchDir, 'config.yaml'), [
+      'telegram:',
+      '  require_mention: false',
+      'model:',
+      '  default: research-model',
+      '',
+    ].join('\n'), 'utf-8')
+    await writeFile(join(researchDir, '.env'), [
+      'TELEGRAM_BOT_TOKEN=old-research-token',
+      '',
+    ].join('\n'), 'utf-8')
+
+    const { updateConfig, updateCredentials, getConfig } = await loadController()
+
+    await updateConfig(makeCtx({
+      section: 'telegram',
+      values: { require_mention: true, free_response_chats: 'chat-1' },
+    }, 'research'))
+    await updateCredentials(makeCtx({
+      platform: 'telegram',
+      values: { token: 'new-research-token' },
+    }, 'research'))
+
+    expect(mockRestartGateway).toHaveBeenCalledWith('research')
+    expect(mockDestroyProfile).not.toHaveBeenCalled()
+    const defaultConfig = YAML.load(await readFile(join(hermesHome, 'config.yaml'), 'utf-8')) as any
+    const researchConfig = YAML.load(await readFile(join(researchDir, 'config.yaml'), 'utf-8')) as any
+    expect(defaultConfig.telegram.require_mention).toBe(false)
+    expect(researchConfig.telegram.require_mention).toBe(true)
+    expect(researchConfig.telegram.free_response_chats).toBe('chat-1')
+    expect(await readFile(join(hermesHome, '.env'), 'utf-8')).toContain('TELEGRAM_BOT_TOKEN=keep-default-token')
+    expect(await readFile(join(researchDir, '.env'), 'utf-8')).toContain('TELEGRAM_BOT_TOKEN=new-research-token')
+
+    const ctx = makeCtx({}, 'research')
+    await getConfig(ctx)
+    expect(ctx.body.platforms.telegram.token).toBe('new-research-token')
+    expect(ctx.body.telegram.require_mention).toBe(true)
+  })
+
+  it('reads and replaces auxiliary model settings in the requested profile', async () => {
+    const researchDir = join(hermesHome, 'profiles', 'research')
+    await mkdir(researchDir, { recursive: true })
+    await writeFile(join(hermesHome, 'config.yaml'), [
+      'model:',
+      '  default: root-model',
+      'auxiliary:',
+      '  compression:',
+      '    provider: openrouter',
+      '    model: root-compressor',
+      '',
+    ].join('\n'), 'utf-8')
+    await writeFile(join(researchDir, 'config.yaml'), [
+      'model:',
+      '  default: research-model',
+      'auxiliary:',
+      '  vision:',
+      '    provider: main',
+      '  web_extract:',
+      '    provider: auto',
+      '    base_url: keep-visible-base-url',
+      '    api_key: keep-visible-api-key',
+      '',
+    ].join('\n'), 'utf-8')
+
+    const { getAuxiliaryModels, updateAuxiliaryModels } = await loadController()
+    const readCtx = makeCtx({})
+    readCtx.get = vi.fn((name: string) => name.toLowerCase() === 'x-hermes-profile' ? 'research' : '')
+
+    await getAuxiliaryModels(readCtx)
+
+    expect(readCtx.body.auxiliary).toEqual({
+      vision: { provider: 'main' },
+      web_extract: {
+        provider: 'auto',
+        base_url: 'keep-visible-base-url',
+        api_key: 'keep-visible-api-key',
+      },
+    })
+    expect(readCtx.body.tasks.some((task: any) => task.key === 'compression' && task.default_timeout === 120)).toBe(true)
+    expect(readCtx.body.tasks.some((task: any) => task.key === 'vision' && task.default_download_timeout === 30)).toBe(true)
+
+    const writeCtx = makeCtx({
+      auxiliary: {
+        compression: {
+          provider: ' openrouter ',
+          model: ' google/gemini-3-flash-preview ',
+          timeout: 120.7,
+          download_timeout: 30,
+          extra_body: { temperature: 0 },
+          ignored: 'drop',
+        },
+        empty_task: {
+          provider: 'auto',
+          model: 'drop-model',
+          base_url: 'drop-base-url',
+          api_key: 'drop-api-key',
+          extra_body: { should: 'drop' },
+          timeout: 30,
+        },
+        blank_task: {
+          provider: '',
+          model: '',
+        },
+      },
+    })
+    writeCtx.get = vi.fn((name: string) => name.toLowerCase() === 'x-hermes-profile' ? 'research' : '')
+
+    await updateAuxiliaryModels(writeCtx)
+
+    expect(writeCtx.body).toEqual({
+      success: true,
+      auxiliary: {
+        compression: {
+          provider: 'openrouter',
+          model: 'google/gemini-3-flash-preview',
+          timeout: 120,
+          extra_body: { temperature: 0 },
+        },
+        empty_task: {
+          provider: 'auto',
+          timeout: 30,
+        },
+      },
+    })
+    const rootConfig = YAML.load(await readFile(join(hermesHome, 'config.yaml'), 'utf-8')) as any
+    const researchConfig = YAML.load(await readFile(join(researchDir, 'config.yaml'), 'utf-8')) as any
+    expect(rootConfig.auxiliary.compression.model).toBe('root-compressor')
+    expect(researchConfig.model.default).toBe('research-model')
+    expect(researchConfig.auxiliary).toEqual({
+      compression: {
+        provider: 'openrouter',
+        model: 'google/gemini-3-flash-preview',
+        timeout: 120,
+        extra_body: { temperature: 0 },
+      },
+      empty_task: {
+        provider: 'auto',
+        timeout: 30,
+      },
+    })
   })
 })

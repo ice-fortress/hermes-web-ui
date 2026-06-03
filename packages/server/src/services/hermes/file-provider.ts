@@ -5,7 +5,7 @@ import { promisify } from 'util'
 import { existsSync, readFileSync } from 'fs'
 import YAML from 'js-yaml'
 import { config } from '../../config'
-import { getActiveProfileDir, getActiveEnvPath } from './hermes-profile'
+import { getActiveProfileDir, getActiveEnvPath, getProfileDir } from './hermes-profile'
 import { isPathWithin, relativePathFromBase } from './hermes-path'
 
 const execFileAsync = promisify(execFile)
@@ -61,6 +61,7 @@ export interface TerminalConfig {
   docker_container_name?: string
   cwd?: string
   singularity_image?: string
+  ssh_port?: number
 }
 
 /**
@@ -94,6 +95,14 @@ export function isInUploadDir(filePath: string): boolean {
   return isPathWithin(filePath, config.uploadDir)
 }
 
+function homeDirForProfile(profile?: string): string {
+  return profile ? getProfileDir(profile) : getActiveProfileDir()
+}
+
+function envPathForProfile(profile?: string): string {
+  return profile ? join(getProfileDir(profile), '.env') : getActiveEnvPath()
+}
+
 /**
  * Check if a relative path refers to a sensitive file.
  */
@@ -107,8 +116,8 @@ export function isSensitivePath(relativePath: string): boolean {
  * Resolve a relative path to an absolute path under the hermes home directory.
  * Validates path safety (no traversal).
  */
-export function resolveHermesPath(relativePath: string): string {
-  const homeDir = getActiveProfileDir()
+export function resolveHermesPath(relativePath: string, profile?: string): string {
+  const homeDir = homeDirForProfile(profile)
   if (!relativePath || relativePath === '.' || relativePath === '/') {
     return homeDir
   }
@@ -127,6 +136,7 @@ export function resolveHermesPath(relativePath: string): string {
 
 export class LocalFileProvider implements FileProvider {
   type: BackendType = 'local'
+  constructor(private homeDir = getActiveProfileDir()) {}
 
   async readFile(filePath: string): Promise<Buffer> {
     const p = validatePath(filePath)
@@ -150,14 +160,13 @@ export class LocalFileProvider implements FileProvider {
 
   async listDir(dirPath: string): Promise<FileEntry[]> {
     const p = validatePath(dirPath)
-    const homeDir = getActiveProfileDir()
     const entries = await readdir(p, { withFileTypes: true })
     const results: FileEntry[] = []
     for (const entry of entries) {
       try {
         const fullPath = resolve(p, entry.name)
         const s = await fsStat(fullPath)
-        const relPath = relativePathFromBase(fullPath, homeDir) ?? entry.name
+        const relPath = relativePathFromBase(fullPath, this.homeDir) ?? entry.name
         results.push({
           name: entry.name,
           path: relPath,
@@ -174,9 +183,8 @@ export class LocalFileProvider implements FileProvider {
 
   async stat(filePath: string): Promise<FileStat> {
     const p = validatePath(filePath)
-    const homeDir = getActiveProfileDir()
     const s = await fsStat(p)
-    const relPath = relativePathFromBase(p, homeDir) ?? basename(p)
+    const relPath = relativePathFromBase(p, this.homeDir) ?? basename(p)
     return {
       name: basename(p),
       path: relPath || basename(p),
@@ -273,9 +281,11 @@ function parseStatOutput(output: string, relativePath: string): FileStat {
 export class DockerFileProvider implements FileProvider {
   type: BackendType = 'docker'
   private containerName: string
+  private homeDir: string
 
-  constructor(containerName: string) {
+  constructor(containerName: string, homeDir = getActiveProfileDir()) {
     this.containerName = containerName
+    this.homeDir = homeDir
   }
 
   async readFile(filePath: string): Promise<Buffer> {
@@ -315,8 +325,7 @@ export class DockerFileProvider implements FileProvider {
       const { stdout } = await execFileAsync('docker', [
         'exec', this.containerName, 'ls', '-la', '--time-style=+%Y-%m-%dT%H:%M:%S', p,
       ], { maxBuffer: 10 * 1024 * 1024, timeout: BACKEND_TIMEOUT, ...execOpts })
-      const homeDir = getActiveProfileDir()
-      const relParent = relativePathFromBase(p, homeDir) ?? ''
+      const relParent = relativePathFromBase(p, this.homeDir) ?? ''
       return parseLsOutput(stdout, relParent)
     } catch (err: any) {
       if (err.code === 'ETIMEDOUT' || err.killed) throw Object.assign(new Error('Backend timeout'), { code: 'backend_timeout' })
@@ -332,8 +341,7 @@ export class DockerFileProvider implements FileProvider {
       const { stdout } = await execFileAsync('docker', [
         'exec', this.containerName, 'stat', '-c', '%n|%F|%s|%Y', p,
       ], { timeout: BACKEND_TIMEOUT, ...execOpts })
-      const homeDir = getActiveProfileDir()
-      const relPath = relativePathFromBase(p, homeDir) ?? basename(p)
+      const relPath = relativePathFromBase(p, this.homeDir) ?? basename(p)
       return parseStatOutput(stdout, relPath)
     } catch (err: any) {
       if (err.code === 'ETIMEDOUT' || err.killed) throw Object.assign(new Error('Backend timeout'), { code: 'backend_timeout' })
@@ -414,16 +422,20 @@ export class SSHFileProvider implements FileProvider {
   private host: string
   private user: string
   private keyPath?: string
+  private port?: number
+  private homeDir: string
 
-  constructor(host: string, user: string, keyPath?: string) {
+  constructor(host: string, user: string, keyPath?: string, homeDir = getActiveProfileDir(), port?: number) {
     this.host = host
     this.user = user
     this.keyPath = keyPath
+    this.port = port
+    this.homeDir = homeDir
   }
 
   private sshArgs(): string[] {
-    // StrictHostKeyChecking disabled for automated tooling with user-configured hosts
     const args = ['-o', 'StrictHostKeyChecking=no', '-o', 'BatchMode=yes']
+    if (this.port) args.push('-p', String(this.port))
     if (this.keyPath) args.push('-i', this.keyPath)
     args.push(`${this.user}@${this.host}`)
     return args
@@ -475,8 +487,7 @@ export class SSHFileProvider implements FileProvider {
       const { stdout } = await execFileAsync('ssh', [
         ...this.sshArgs(), `ls -la --time-style=+%Y-%m-%dT%H:%M:%S ${this.shellEscape(p)}`,
       ], { maxBuffer: 10 * 1024 * 1024, timeout: BACKEND_TIMEOUT, ...execOpts })
-      const homeDir = getActiveProfileDir()
-      const relParent = relativePathFromBase(p, homeDir) ?? ''
+      const relParent = relativePathFromBase(p, this.homeDir) ?? ''
       return parseLsOutput(stdout, relParent)
     } catch (err: any) {
       if (err.code === 'ETIMEDOUT' || err.killed) throw Object.assign(new Error('Backend timeout'), { code: 'backend_timeout' })
@@ -492,8 +503,7 @@ export class SSHFileProvider implements FileProvider {
       const { stdout } = await execFileAsync('ssh', [
         ...this.sshArgs(), `stat -c '%n|%F|%s|%Y' ${this.shellEscape(p)}`,
       ], { timeout: BACKEND_TIMEOUT, ...execOpts })
-      const homeDir = getActiveProfileDir()
-      const relPath = relativePathFromBase(p, homeDir) ?? basename(p)
+      const relPath = relativePathFromBase(p, this.homeDir) ?? basename(p)
       return parseStatOutput(stdout, relPath)
     } catch (err: any) {
       if (err.code === 'ETIMEDOUT' || err.killed) throw Object.assign(new Error('Backend timeout'), { code: 'backend_timeout' })
@@ -572,9 +582,11 @@ export class SSHFileProvider implements FileProvider {
 export class SingularityFileProvider implements FileProvider {
   type: BackendType = 'singularity'
   private imagePath: string
+  private homeDir: string
 
-  constructor(imagePath: string) {
+  constructor(imagePath: string, homeDir = getActiveProfileDir()) {
     this.imagePath = imagePath
+    this.homeDir = homeDir
   }
 
   async readFile(filePath: string): Promise<Buffer> {
@@ -614,8 +626,7 @@ export class SingularityFileProvider implements FileProvider {
       const { stdout } = await execFileAsync('singularity', [
         'exec', this.imagePath, 'ls', '-la', '--time-style=+%Y-%m-%dT%H:%M:%S', p,
       ], { maxBuffer: 10 * 1024 * 1024, timeout: BACKEND_TIMEOUT, ...execOpts })
-      const homeDir = getActiveProfileDir()
-      const relParent = relativePathFromBase(p, homeDir) ?? ''
+      const relParent = relativePathFromBase(p, this.homeDir) ?? ''
       return parseLsOutput(stdout, relParent)
     } catch (err: any) {
       if (err.code === 'ETIMEDOUT' || err.killed) throw Object.assign(new Error('Backend timeout'), { code: 'backend_timeout' })
@@ -631,8 +642,7 @@ export class SingularityFileProvider implements FileProvider {
       const { stdout } = await execFileAsync('singularity', [
         'exec', this.imagePath, 'stat', '-c', '%n|%F|%s|%Y', p,
       ], { timeout: BACKEND_TIMEOUT, ...execOpts })
-      const homeDir = getActiveProfileDir()
-      const relPath = relativePathFromBase(p, homeDir) ?? basename(p)
+      const relPath = relativePathFromBase(p, this.homeDir) ?? basename(p)
       return parseStatOutput(stdout, relPath)
     } catch (err: any) {
       if (err.code === 'ETIMEDOUT' || err.killed) throw Object.assign(new Error('Backend timeout'), { code: 'backend_timeout' })
@@ -711,9 +721,9 @@ export class SingularityFileProvider implements FileProvider {
 /**
  * Read terminal config from hermes config.yaml.
  */
-export function getTerminalConfig(): TerminalConfig {
+export function getTerminalConfig(profile?: string): TerminalConfig {
   try {
-    const configPath = join(getActiveProfileDir(), 'config.yaml')
+    const configPath = join(homeDirForProfile(profile), 'config.yaml')
     if (!existsSync(configPath)) return { backend: 'local' }
     const raw = readFileSync(configPath, 'utf-8')
     const doc = YAML.load(raw, { json: true }) as any
@@ -733,9 +743,9 @@ export function getTerminalConfig(): TerminalConfig {
 /**
  * Read SSH env vars from hermes .env file.
  */
-function getSSHEnvVars(): { host?: string; user?: string; key?: string } {
+function getSSHEnvVars(profile?: string): { host?: string; user?: string; key?: string; port?: number } {
   try {
-    const envPath = getActiveEnvPath()
+    const envPath = envPathForProfile(profile)
     if (!existsSync(envPath)) return {}
     const raw = readFileSync(envPath, 'utf-8')
     const vars: Record<string, string> = {}
@@ -754,6 +764,7 @@ function getSSHEnvVars(): { host?: string; user?: string; key?: string } {
       host: vars.TERMINAL_SSH_HOST,
       user: vars.TERMINAL_SSH_USER,
       key: vars.TERMINAL_SSH_KEY,
+      port: vars.TERMINAL_SSH_PORT ? parseInt(vars.TERMINAL_SSH_PORT, 10) : undefined,
     }
   } catch {
     return {}
@@ -783,43 +794,44 @@ async function resolveDockerContainer(cfg: TerminalConfig): Promise<string> {
 
 // --- Factory ---
 
-// Cache the provider for a short time to avoid re-reading config on every request
-let cachedProvider: FileProvider | null = null
-let cachedAt = 0
+// Cache providers for a short time to avoid re-reading config on every request
+const providerCache = new Map<string, { provider: FileProvider; cachedAt: number }>()
 const CACHE_TTL = 10_000
 
 /** @internal — for testing only */
 export function _resetFileProviderCache() {
-  cachedProvider = null
-  cachedAt = 0
+  providerCache.clear()
 }
 
 /**
  * Create a FileProvider based on the active hermes terminal config.
  * Defaults to LocalFileProvider if config cannot be read or backend is unknown.
  */
-export async function createFileProvider(): Promise<FileProvider> {
+export async function createFileProvider(profile?: string): Promise<FileProvider> {
   const now = Date.now()
-  if (cachedProvider && now - cachedAt < CACHE_TTL) return cachedProvider
+  const homeDir = homeDirForProfile(profile)
+  const cacheKey = profile || homeDir
+  const cached = providerCache.get(cacheKey)
+  if (cached && now - cached.cachedAt < CACHE_TTL) return cached.provider
 
-  const cfg = getTerminalConfig()
+  const cfg = getTerminalConfig(profile)
   let provider: FileProvider
 
   switch (cfg.backend) {
     case 'docker': {
       const container = await resolveDockerContainer(cfg)
-      provider = new DockerFileProvider(container)
+      provider = new DockerFileProvider(container, homeDir)
       break
     }
     case 'ssh': {
-      const ssh = getSSHEnvVars()
+      const ssh = getSSHEnvVars(profile)
       if (!ssh.host || !ssh.user) {
         throw Object.assign(
           new Error('SSH backend requires TERMINAL_SSH_HOST and TERMINAL_SSH_USER in .env'),
           { code: 'backend_error' },
         )
       }
-      provider = new SSHFileProvider(ssh.host, ssh.user, ssh.key)
+      provider = new SSHFileProvider(ssh.host, ssh.user, ssh.key, homeDir, ssh.port)
       break
     }
     case 'singularity': {
@@ -829,7 +841,7 @@ export async function createFileProvider(): Promise<FileProvider> {
           { code: 'backend_error' },
         )
       }
-      provider = new SingularityFileProvider(cfg.singularity_image)
+      provider = new SingularityFileProvider(cfg.singularity_image, homeDir)
       break
     }
     case 'modal':
@@ -839,11 +851,10 @@ export async function createFileProvider(): Promise<FileProvider> {
         { code: 'unsupported_backend' },
       )
     default:
-      provider = new LocalFileProvider()
+      provider = new LocalFileProvider(homeDir)
   }
 
-  cachedProvider = provider
-  cachedAt = now
+  providerCache.set(cacheKey, { provider, cachedAt: now })
   return provider
 }
 

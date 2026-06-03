@@ -1,4 +1,19 @@
 export default {
+  brand: {
+    name: 'Hermes Web UI',
+    logoAlt: 'Hermes',
+  },
+  ui: {
+    copy: '复制',
+    copied: '已复制',
+    darkTheme: '深色',
+    lightTheme: '浅色',
+    darkMode: '深色模式',
+    lightMode: '浅色模式',
+    menu: '菜单',
+    switchToChinese: '中文',
+    switchToEnglish: 'English',
+  },
   nav: {
     home: '首页',
     docs: '文档',
@@ -40,11 +55,11 @@ export default {
     },
     profiles: {
       title: '多配置',
-      desc: '隔离的多配置文件，独立配置。支持克隆、导入/导出，并通过 agent bridge 运行聊天。',
+      desc: '按账号授权的 Hermes Profile，隔离配置、模型、上传、任务、用量、记忆、技能、插件和 Provider。',
     },
     files: {
       title: '文件管理',
-      desc: '跨本地、Docker、SSH 和 Singularity 管理文件，支持上传、预览和编辑。',
+      desc: '跨本地、Docker、SSH 和 Singularity 管理文件，支持按 Profile 上传、按路径下载、预览和编辑。',
     },
     terminal: {
       title: 'Web 终端',
@@ -75,9 +90,61 @@ export default {
     wechat: '微信',
     wecom: '企业微信',
   },
+  screenshots: {
+    localUrl: 'http://localhost:8648',
+    previous: '上一张截图',
+    next: '下一张截图',
+    goTo: '查看第 {number} 张截图',
+    items: [
+      { src: '/image1.png', alt: '带图片生成的 AI 聊天界面' },
+      { src: '/image2.png', alt: '聊天和文件浏览器界面' },
+      { src: '/image3.png', alt: '多面板工作区界面' },
+      { src: '/image4.png', alt: '看板管理界面' },
+    ],
+  },
   install: {
     title: '快速开始',
-    desc: '一分钟内启动 Hermes Web UI。',
+    desc: '下载桌面应用，或自行运行 Hermes Web UI。',
+    desktop: {
+      title: '桌面版',
+      download: '下载',
+      githubDownload: 'GitHub 下载',
+      cloudflareDownload: 'Cloudflare 下载',
+      allDownloads: '查看全部发布文件',
+      prereq: '桌面版已内置 Web UI 运行时。',
+      downloads: [
+        {
+          title: 'macOS Apple Silicon',
+          desc: 'Apple Silicon DMG',
+          assetSuffix: 'arm64.dmg',
+        },
+        {
+          title: 'macOS Intel',
+          desc: 'x64 DMG',
+          assetSuffix: 'x64.dmg',
+        },
+        {
+          title: 'Windows',
+          desc: 'x64 安装包',
+          assetSuffix: 'x64.exe',
+        },
+        {
+          title: 'Linux x64 AppImage',
+          desc: 'x64 AppImage',
+          assetSuffix: 'x86_64.AppImage',
+        },
+        {
+          title: 'Linux x64 Debian',
+          desc: 'amd64 .deb 安装包',
+          assetSuffix: 'amd64.deb',
+        },
+        {
+          title: 'Linux arm64',
+          desc: 'arm64 AppImage',
+          assetSuffix: 'arm64.AppImage',
+        },
+      ],
+    },
     npm: {
       title: 'npm',
       cmd1: 'npm install -g hermes-web-ui',
@@ -97,6 +164,10 @@ export default {
   starHistory: {
     title: '社区成长',
     desc: '在 GitHub 上给我们加星，加入社区。',
+    star: '加星',
+    licenseAlt: '许可证',
+    versionAlt: '版本',
+    chartAlt: 'Star 历史',
   },
   footer: {
     description: 'Hermes Agent 的自托管 AI 聊天仪表板。',
@@ -104,6 +175,7 @@ export default {
     madeWith: '使用 Vue 3、Naive UI 和 TypeScript 构建。',
   },
   docs: {
+    placeholder: '从侧边栏选择一个章节开始阅读。',
     sidebar: {
       gettingStarted: '快速开始',
       configuration: '配置说明',
@@ -124,7 +196,7 @@ export default {
       },
       login: {
         title: '登录',
-        content: '自动生成的令牌存储在 ~/.hermes-web-ui/.token。首次登录后可在设置页面配置用户名/密码登录。',
+        content: '自动生成的令牌存储在 ~/.hermes-web-ui/.token。首次使用可通过默认登录名 admin / 默认密码 123456 登录；登录后系统会提示尽快修改默认账户和密码。',
       },
     },
     configuration: {
@@ -133,22 +205,60 @@ export default {
       envVars: {
         title: '环境变量',
         rows: [
-          ['AUTH_DISABLED', '设为 "1" 禁用认证'],
-          ['AUTH_TOKEN', '自定义认证令牌（覆盖自动生成的令牌）'],
           ['PORT', '服务器监听端口（默认：8648）'],
           ['BIND_HOST', '服务器绑定地址（默认：0.0.0.0）。如需 IPv6，请显式设置为 ::。'],
-          ['UPLOAD_DIR', '自定义上传目录路径'],
+          ['HERMES_WEB_UI_HOME', 'Web UI 数据目录，用于认证 token、登录凭据、日志、数据库和默认上传目录'],
+          ['HERMES_WEBUI_STATE_DIR', 'HERMES_WEB_UI_HOME 的兼容别名'],
+          ['UPLOAD_DIR', '自定义上传根目录。文件会保存在按 Profile 隔离的子目录下'],
           ['CORS_ORIGINS', 'CORS 来源配置（默认：*）'],
-          ['HERMES_BIN', '自定义 hermes CLI 二进制路径'],
+          ['AUTH_TOKEN', '自定义 bearer token，会覆盖自动生成的 token'],
+          ['AUTH_JWT_SECRET', '用户名/密码会话的 JWT 签名密钥覆盖'],
+          ['PROFILE', '启动/默认 Hermes profile'],
+          ['LOG_LEVEL', 'Server 日志级别'],
+          ['BRIDGE_LOG_LEVEL', 'Bridge 日志级别'],
+          ['MAX_DOWNLOAD_SIZE', '最大文件下载大小'],
+          ['MAX_EDIT_SIZE', '最大可编辑文件大小'],
+          ['WORKSPACE_BASE', 'Workspace 浏览根目录'],
+          ['HERMES_HOME', 'Hermes 数据目录'],
+          ['HERMES_BIN', '自定义 Hermes CLI 二进制路径'],
+          ['HERMES_AGENT_ROOT', '包含 run_agent.py 的 Hermes Agent 源码目录'],
+          ['HERMES_AGENT_BRIDGE_PYTHON', '用于启动 agent bridge 的 Python 解释器'],
+          ['HERMES_AGENT_BRIDGE_UV', '可用时用于启动 agent bridge 的 uv 可执行文件'],
+          ['UV', 'uv 可执行文件 fallback'],
+          ['PYTHON', 'agent bridge 的 Python 可执行文件 fallback'],
+          ['HERMES_AGENT_BRIDGE_ENDPOINT', 'Agent bridge broker endpoint。Windows 默认 tcp://127.0.0.1:18765；macOS/Linux 默认 ipc:///tmp/hermes-agent-bridge.sock'],
+          ['HERMES_AGENT_BRIDGE_TIMEOUT_MS', 'Node 请求 bridge broker 的响应超时'],
+          ['HERMES_AGENT_BRIDGE_CONNECT_RETRY_MS', '连接 bridge socket 失败时的短重试窗口'],
+          ['HERMES_AGENT_BRIDGE_STARTUP_TIMEOUT_MS', '等待 Python bridge ready 的超时'],
+          ['HERMES_AGENT_BRIDGE_AUTO_RESTART', 'bridge broker 意外退出后是否自动重启；设为 0/false/no/off 可关闭'],
+          ['HERMES_AGENT_BRIDGE_RESTART_DELAY_MS', 'bridge 自动重启退避的基础延迟'],
+          ['HERMES_AGENT_BRIDGE_PLATFORM', '传给 Hermes Agent 的 platform 标识'],
+          ['HERMES_AGENT_BRIDGE_WORKER_TRANSPORT', 'profile worker endpoint transport。设为 tcp 使用 loopback TCP；设为 ipc/unix 使用 Unix domain socket；默认 Windows TCP、macOS/Linux IPC'],
+          ['HERMES_AGENT_BRIDGE_WORKER_PORT_BASE', 'TCP worker endpoint 起始端口（默认：18780）。Version Preview 会使用独立端口段 19650'],
+          ['HERMES_BRIDGE_PROVIDER', 'bridge 运行时的 provider 覆盖'],
+          ['HERMES_BRIDGE_TOOLSETS', 'bridge 运行时的 toolset 覆盖'],
+          ['HERMES_BRIDGE_MAX_TURNS', 'bridge 运行时的最大轮数覆盖'],
+          ['HERMES_BRIDGE_SUPPRESS_PLATFORM_HINT', '控制传给 Hermes Agent 的 bridge platform hint suppression'],
+          ['HERMES_OPENROUTER_APP_REFERER', 'bridge 运行发送给 OpenRouter 的 attribution referer'],
+          ['HERMES_OPENROUTER_APP_TITLE', 'bridge 运行发送给 OpenRouter 的 attribution title'],
+          ['HERMES_OPENROUTER_APP_CATEGORIES', 'bridge 运行发送给 OpenRouter 的 attribution categories'],
+          ['HERMES_WEB_UI_MANAGED_GATEWAY', '强制启用旧 gateway 进程托管'],
+          ['HERMES_WEB_UI_STOP_GATEWAYS_ON_SHUTDOWN', 'Web UI 关闭时是否同时停止托管的 gateway 进程'],
+          ['GATEWAY_HOST', '旧 gateway 兼容配置中写入 profile 的默认 gateway host'],
+          ['HERMES_WEB_UI_PREVIEW_REPO', 'Version Preview 使用的 GitHub 仓库'],
+          ['HERMES_WEB_UI_PREVIEW_AGENT_BRIDGE_TRANSPORT', 'Version Preview 的 broker endpoint transport。设为 tcp 可让预览环境在 macOS/Linux 上也使用 loopback TCP；未设置时会跟随 HERMES_AGENT_BRIDGE_WORKER_TRANSPORT=tcp'],
+          ['HERMES_WEB_UI_PREVIEW_AGENT_BRIDGE_ENDPOINT', '直接覆盖 Version Preview 的 broker endpoint；用于需要完全自定义预览 bridge 地址的部署'],
+          ['HERMES_WEB_UI_BACKEND_PORT', 'Vite dev proxy 使用的后端端口'],
+          ['HERMES_WEB_UI_FRONTEND_PORT', '前端 Vite dev server 端口'],
         ],
       },
       gateway: {
         title: 'Agent Bridge 运行时',
-        content: '聊天运行通过 Hermes agent bridge 处理。它随 Web UI 服务一起运行，并直接连接 Hermes Agent runtime。Web UI 不再启动或管理独立的 gateway 进程。',
+        content: '聊天运行通过 Hermes agent bridge 处理。它随 Web UI 服务一起运行，并直接连接 Hermes Agent runtime。HERMES_AGENT_BRIDGE_ENDPOINT 控制 Node 与 bridge broker 的连接地址；HERMES_AGENT_BRIDGE_WORKER_TRANSPORT 控制 broker 与各 Profile worker 的连接方式。前端切换 Hermes Profile 只影响后续请求上下文，不会重启 bridge 或清理其他正在运行的任务。',
       },
       profiles: {
         title: '配置文件',
-        content: '配置文件为不同场景提供隔离的配置。每个配置文件拥有独立的 Hermes 配置和缓存。可在配置页面创建、克隆、导入或导出配置文件。',
+        content: 'Profile 为不同场景提供隔离配置。超级管理员可以管理全部 Profile；普通管理员只能查看和使用分配给自己的 Profile。可在 Profile 页面创建、克隆、导入、导出或切换 Hermes Profile。',
       },
     },
     features: {
@@ -156,7 +266,7 @@ export default {
       intro: '探索 Hermes Web UI 的核心功能。',
       chat: {
         title: 'AI 聊天',
-        content: '通过 Socket.IO /chat-run 实时流式聊天。支持多会话管理、Markdown 渲染与语法高亮、工具调用检查、文件上传/下载，以及 Ctrl+K 搜索 Web UI 本地会话库。',
+        content: '通过 Socket.IO /chat-run 实时流式聊天。支持多会话管理、Markdown 渲染与语法高亮、工具调用检查、按 Profile 上传、按路径下载，以及 Ctrl+K 搜索 Web UI 本地会话库。',
       },
       kanban: {
         title: '看板管理',
@@ -184,7 +294,7 @@ export default {
       },
       files: {
         title: '文件管理',
-        content: '浏览和管理本地、Docker、SSH 和 Singularity 等远程后端上的文件。支持上传、下载、重命名、移动、删除文件以及带语法高亮的内容预览。',
+        content: '浏览和管理本地、Docker、SSH 和 Singularity 等远程后端上的文件。上传保存到当前选择/请求的 Profile；下载按真实路径解析，因此上传目录外的 Agent 产物也可以下载。',
       },
       analytics: {
         title: '用量分析',
@@ -232,7 +342,7 @@ export default {
       intro: 'Hermes Web UI 提供本地 BFF API，并通过 Socket.IO 端点进行聊天流式通信。',
       local: {
         title: '本地 BFF 端点',
-        content: 'Koa 服务器处理会话管理、配置文件 CRUD、配置读写、日志访问、技能列表、记忆操作和静态资源。',
+        content: 'Koa 服务器处理会话管理、Profile CRUD、分账户分 Profile 管理、配置读写、日志访问、技能列表、记忆操作和静态资源。',
       },
       proxy: {
         title: '聊天流式通信',
@@ -240,7 +350,7 @@ export default {
       },
       auth: {
         title: '认证',
-        content: '所有 API 端点需要通过 Authorization 头提供 Bearer 令牌。令牌在首次运行时自动生成并存储在 ~/.hermes-web-ui/.token。可在设置页面配置可选的用户名/密码登录。',
+        content: 'API 端点需要经过认证访问。令牌在首次运行时自动生成并存储在 ~/.hermes-web-ui/.token。用户名/密码登录使用账户记录；超级管理员管理用户和 Profile 绑定，普通管理员管理自己的账户信息。',
       },
     },
   },
